@@ -235,17 +235,27 @@ Log back in for the changes to take effect.
 
 # AI/ML Use Cases
 
-rdma-pipe is exceptionally well-suited for AI/ML workloads. See the **[AI Model Loading Performance Guide](AI_MODEL_LOADING_GUIDE.md)** for:
+rdma-pipe is exceptionally well-suited for AI/ML workloads. 
 
-* **10-15x faster model loading** compared to traditional methods (SCP, NFS, rsync)
-* **90-98% infrastructure cost savings** for training and inference
-* Detailed strategies for:
-  - Loading large language model weights (LLaMA, GPT, etc.)
-  - Distributing training datasets
-  - Checkpoint management for distributed training
-  - Multi-node model deployment
-* Real-world examples and workflows
-* Cost analysis and ROI calculations
+**📚 Documentation for AI/ML Users:**
+
+- **[Quick Start Guide](AI_QUICK_START.md)** - Copy-paste examples for common AI/ML workflows
+  - Load model weights (LLaMA, GPT, Stable Diffusion, etc.)
+  - Transfer training datasets
+  - Checkpoint management
+  - Multi-node deployment
+  
+- **[Performance Guide](AI_MODEL_LOADING_GUIDE.md)** - Comprehensive technical guide
+  - 10-15x faster model loading compared to traditional methods
+  - Detailed implementation strategies
+  - Deployment patterns and best practices
+  - Real-world examples and workflows
+  
+- **[Cost Savings Analysis](COST_SAVINGS.md)** - Business case and ROI
+  - 90-98% infrastructure cost savings
+  - $17.7M annual savings for large organizations
+  - 3-day payback period
+  - Detailed ROI calculations
 
 # Alternatives
 
