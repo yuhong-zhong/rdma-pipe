@@ -121,18 +121,12 @@ int main(int argc, char *argv[]) {
       fprintf(stderr, "Error opening file %s (%d)\n", argv[argv_idx], errno);
       return 200;
     }
-    // Hint to kernel: sequential write pattern
-    posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
-    
     use_parallel_writes = 1;
     // Open 8 parallel file descriptors.
     for (int i = 0; i < 8; i++) {
       fds[i] = open(argv[argv_idx], O_WRONLY | O_DIRECT);
       if (fds[i] < 0) {
         use_parallel_writes = 0;
-      } else {
-        // Hint to kernel: sequential write pattern
-        posix_fadvise(fds[i], 0, 0, POSIX_FADV_SEQUENTIAL);
       }
     }
   }
@@ -347,97 +341,52 @@ int main(int argc, char *argv[]) {
         }
       }
       if (i == 0) { // Second time around, we have the key.
-        // Use parallel writes if available and message is aligned.
-        // msgLen must be 4K-aligned and ≥1MB for parallel O_DIRECT writes.
-        if (use_parallel_writes == 1 && total_bytes % 4096 == 0 &&
-            msgLen % 4096 == 0 && msgLen >= 1048576) {
-          // Striped parallel write to the file using O_DIRECT.
-          // Each chunk must be 4K-aligned for O_DIRECT.
-          const int num_threads = 8;
-          const ssize_t base_chunk_size = msgLen / num_threads;
-          const ssize_t aligned_chunk_size = base_chunk_size & ~4095; // Round down to 4K
-          
-          // Safety check: ensure chunks are large enough
-          if (aligned_chunk_size == 0) {
-            // Fall back to single-threaded write
-            ssize_t written = 0;
-            while (written < msgLen) {
-              ssize_t res = pwrite(fd, cbuf + written, msgLen - written, 
-                                   total_bytes + written);
-              if (res <= 0) {
-                if (res == -1) {
-                  fprintf(stderr, "Write error %d\n", errno);
-                }
-                break;
-              }
-              written += res;
-            }
-            total_bytes += written;
-            if (written < msgLen) {
-              break;
-            }
-          } else {
-            ssize_t buf_written_bytes = 0;
-            int error = 0;
-#pragma omp parallel for
-            for (int j = 0; j < num_threads; j++) {
-              ssize_t offset = j * aligned_chunk_size;
-              ssize_t bytes_to_write = aligned_chunk_size;
-              
-              // Last thread writes remaining bytes (still 4K-aligned since msgLen is)
-              if (j == num_threads - 1) {
-                bytes_to_write = msgLen - offset;
-                // Verify alignment for O_DIRECT
-                if (bytes_to_write % 4096 != 0 || bytes_to_write == 0) {
-                  error = 1;
-                  fprintf(stderr, "Alignment error in parallel write\n");
-                  continue;
-                }
-              }
-              
-              ssize_t written = 0;
-              while (written < bytes_to_write) {
-                ssize_t res = pwrite(fds[j], cbuf + offset + written, 
-                                     bytes_to_write - written, 
-                                     total_bytes + offset + written);
-                if (res <= 0) {
-                  if (res == -1) {
-                    fprintf(stderr, "Write error %d\n", errno);
-                  }
-                  error = 1;
-                  break;
-                }
-                written += res;
-              }
-              
-              if (!error) {
-#pragma omp atomic
-                buf_written_bytes += written;
-              }
-            }
-            if (error == 1) {
-              break;
-            }
-            total_bytes += buf_written_bytes;
+        // Only do parallel IO_DIRECT writes if we have IO_DIRECT support,
+        // we're writing to a sector-aligned address and the message is
+        // sector-aligned.
+        if (use_parallel_writes == 0 || total_bytes % 4096 != 0 ||
+            msgLen != 8 * 1048576) {
+          lseek(fd, total_bytes, SEEK_SET);
+          ssize_t res = write(fd, cbuf, msgLen);
+          while (res < msgLen) {
+            res += write(fd, cbuf+res, msgLen-res);
           }
-        } else {
-          // Fall back to single-threaded write using pwrite for efficiency.
-          ssize_t written = 0;
-          while (written < msgLen) {
-            ssize_t res = pwrite(fd, cbuf + written, msgLen - written, 
-                                 total_bytes + written);
-            if (res <= 0) {
-              if (res == -1) {
-                fprintf(stderr, "Write error %d\n", errno);
-              }
-              break;
-            }
-            written += res;
-          }
-          total_bytes += written;
-          if (written < msgLen) {
+          total_bytes += res;
+          if (res == -1) {
+            fprintf(stderr, "Write error %d\n", errno);
             break;
           }
+        } else {
+          // Add msgLen to the fd file size.
+          if (ftruncate(fd, total_bytes + msgLen) != 0) {
+            fprintf(stderr, "ftruncate error %d\n", errno);
+            break;
+          }
+          // Striped parallel write to the file.
+          ssize_t buf_written_bytes = 0;
+          int error = 0;
+#pragma omp parallel for
+          for (int j = 0; j < 8; j++) {
+            // Seek to the correct position.
+            lseek(fds[j], total_bytes + j * 1048576, SEEK_SET);
+            ssize_t res = 0;
+            // Write the data.
+            while (res < 1048576) {
+              res += write(fds[j], cbuf + j * 1048576 + res, 1048576 - res);
+            }
+// Atomic add to buf_written_bytes
+#pragma omp atomic
+            buf_written_bytes += res;
+
+            if (res == -1) {
+              fprintf(stderr, "Write error %d\n", errno);
+              error = 1;
+            }
+          }
+          if (error == 1) {
+            break;
+          }
+          total_bytes += buf_written_bytes;
         }
       }
       // printf("%d\n", msgLen);
