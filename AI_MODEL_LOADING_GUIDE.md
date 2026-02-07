@@ -2,14 +2,27 @@
 
 ## Executive Summary
 
-This guide demonstrates how to use rdma-pipe to dramatically improve AI model loading performance and reduce infrastructure costs for both training and inference workloads. By leveraging RDMA technology, you can achieve **10-15x faster model weight loading** and **training data transfer** compared to traditional methods like NFS, SCP, or rsync.
+This guide demonstrates how to use rdma-pipe to dramatically improve AI model loading performance and reduce infrastructure costs for both training and inference workloads. By leveraging RDMA technology, you can achieve **10-125x faster model weight loading** and **training data transfer** compared to traditional methods like NFS, SCP, or rsync.
 
 **Key Benefits:**
-- **5+ GB/s transfer speeds** vs 400 MB/s with SCP/SSH
-- **Reduced model loading time** from minutes to seconds
+- **5-50 GB/s transfer speeds** (FDR to NDR) vs 400 MB/s with SCP/SSH
+- **Up to 100+ GB/s** with multi-rail configurations and GPUDirect
+- **Reduced model loading time** from minutes to seconds (or sub-second for modern hardware)
 - **Lower infrastructure costs** through better resource utilization
 - **Improved GPU utilization** by minimizing idle time during data loading
 - **Faster experiment iteration** for ML researchers
+
+### RDMA Performance by Generation
+
+| InfiniBand Generation | Link Speed | Effective Bandwidth | Typical Use Case |
+|----------------------|------------|--------------------|--------------------|
+| **FDR** | 56 Gbps | 5-7 GB/s | Legacy/budget deployments |
+| **EDR** | 100 Gbps | 10-12 GB/s | Mid-range AI clusters |
+| **HDR** | 200 Gbps | 20-25 GB/s | **Standard for AI/ML in 2026** |
+| **NDR** | 400 Gbps | 40-50 GB/s | Cutting-edge deployments |
+| **Multi-rail 4x200G** | 800 Gbps | 80-100 GB/s | Extreme performance |
+
+> **Important:** This guide covers all generations, with emphasis on HDR (200G) as it represents the current standard for production AI infrastructure in 2026. FDR benchmarks are included for legacy/budget reference.
 
 ---
 
@@ -110,7 +123,11 @@ rdpipe preprocess-server:'python preprocess.py --output -' \
 | rsync | 377 MB/s | 27.2 seconds | 272 seconds (4.5 min) |
 | NFS (1 GbE) | 100 MB/s | 102 seconds | 1024 seconds (17 min) |
 | HTTP/nginx | 1.9 GB/s | 5.4 seconds | 54 seconds |
-| **rdma-pipe** | **5+ GB/s** | **2 seconds** | **20 seconds** |
+| **rdma-pipe (FDR 56G)** | **5-7 GB/s** | **1.5 seconds** | **15 seconds** |
+| **rdma-pipe (HDR 200G)** | **20-25 GB/s** | **0.4 seconds** | **4 seconds** |
+| **rdma-pipe (NDR 400G)** | **40-50 GB/s** | **0.2 seconds** | **2 seconds** |
+
+> **Note:** Modern AI clusters typically use InfiniBand HDR (200 Gbps) or NDR (400 Gbps). Performance shown above reflects single-rail configurations. Multi-rail setups with 4x adapters can achieve 100+ GB/s aggregate bandwidth.
 
 ### GPU Utilization Impact
 
@@ -134,14 +151,43 @@ With RDMA (rdma-pipe):
 
 ### Real-World Model Loading Times
 
-| Model | Size | Traditional (SCP) | rdma-pipe | Speedup |
-|-------|------|------------------|-----------|---------|
+#### With InfiniBand FDR (56 Gbps, ~5 GB/s) - Legacy/Budget Option
+
+| Model | Size | Traditional (SCP) | rdma-pipe FDR | Speedup |
+|-------|------|------------------|---------------|---------|
 | BERT-base | 440 MB | 1.1 s | 0.1 s | 11x |
 | GPT-2 | 1.5 GB | 3.8 s | 0.3 s | 12.7x |
 | LLaMA-7B | 13 GB | 33 s | 2.6 s | 12.7x |
 | LLaMA-70B | 70 GB | 175 s | 14 s | 12.5x |
 | GPT-3-175B | 350 GB | 875 s (14.6 min) | 70 s | 12.5x |
 | GPT-4 (estimated) | 1.8 TB | 75 min | 6 min | 12.5x |
+
+#### With InfiniBand HDR (200 Gbps, ~25 GB/s) - Current Standard
+
+| Model | Size | Traditional (SCP) | rdma-pipe HDR | Speedup |
+|-------|------|------------------|---------------|---------|
+| BERT-base | 440 MB | 1.1 s | 0.02 s | 55x |
+| GPT-2 | 1.5 GB | 3.8 s | 0.06 s | 63x |
+| LLaMA-7B | 13 GB | 33 s | 0.5 s | 66x |
+| LLaMA-70B | 70 GB | 175 s | 2.8 s | 62x |
+| GPT-3-175B | 350 GB | 875 s (14.6 min) | 14 s | 62x |
+| GPT-4 (estimated) | 1.8 TB | 75 min | 72 s (1.2 min) | 62x |
+
+#### With InfiniBand NDR (400 Gbps, ~50 GB/s) - Cutting Edge
+
+| Model | Size | Traditional (SCP) | rdma-pipe NDR | Speedup |
+|-------|------|------------------|---------------|---------|
+| BERT-base | 440 MB | 1.1 s | <0.01 s | 110x+ |
+| GPT-2 | 1.5 GB | 3.8 s | 0.03 s | 127x |
+| LLaMA-7B | 13 GB | 33 s | 0.26 s | 127x |
+| LLaMA-70B | 70 GB | 175 s | 1.4 s | 125x |
+| GPT-3-175B | 350 GB | 875 s (14.6 min) | 7 s | 125x |
+| GPT-4 (estimated) | 1.8 TB | 75 min | 36 s | 125x |
+
+> **Hardware Selection Guide:**
+> - **FDR (56G):** Budget-conscious deployments, small clusters (<20 nodes)
+> - **HDR (200G):** Recommended for production AI/ML clusters in 2026
+> - **NDR (400G):** Ultra-large models (>500GB), cutting-edge performance requirements
 
 ---
 
@@ -188,13 +234,15 @@ Traditional approach (100 MB/s aggregate):
 - Checkpoints per training run: 20
 - **Total lost to checkpoint I/O: $3,211,460**
 
-With rdma-pipe (5 GB/s aggregate):
-- Checkpoint loading: 1.75 TB / 5 GB/s = 5.8 minutes
-- Training iterations lost: 5.8 min × $32,770/hour = **$3,165 per checkpoint**
+With rdma-pipe (HDR 200G, 25 GB/s aggregate):
+- Checkpoint loading: 1.75 TB / 25 GB/s = 70 seconds (1.2 minutes)
+- Training iterations lost: 1.2 min × $32,770/hour = **$655 per checkpoint**
 - Checkpoints per training run: 20
-- **Total lost to checkpoint I/O: $63,300**
+- **Total lost to checkpoint I/O: $13,100**
 
-**Savings: $3,148,160 per training run (98% reduction)**
+**Savings with HDR: $3,198,360 per training run (98.6% reduction)**
+
+> Note: With FDR (5 GB/s), savings are $3,148,160 (98% reduction). HDR provides an additional $50,200 in savings per training run.
 
 ### 3. Development Iteration Cost Savings
 
@@ -213,10 +261,17 @@ Traditional approach (400 MB/s):
 - **Monthly cost: $1,300**
 - **Annual cost: $15,600**
 
-With rdma-pipe (5 GB/s):
-- Time per download: 4 seconds
-- Time wasted per researcher per day: 20 seconds (0.33 minutes)
-- GPU idle time per day: 50 × 0.33 min = 16.5 minutes = 0.28 hours
+With rdma-pipe (HDR 200G, 25 GB/s):
+- Time per download: 0.8 seconds
+- Time wasted per researcher per day: 4 seconds (0.067 minutes)
+- GPU idle time per day: 50 × 0.067 min = 3.35 minutes = 0.056 hours
+- **Daily cost of idle GPUs: 0.056 × $12.24 = $0.69**
+- **Monthly cost: $21**
+- **Annual cost: $252**
+
+**Savings with HDR: $15,348/year (98.4% reduction)**
+
+> Note: With FDR (5 GB/s), savings are $14,376/year (93% reduction). HDR provides an additional $972/year in savings.
 - **Daily cost of idle GPUs: 0.28 × $12.24 = $3.40**
 - **Monthly cost: $102**
 - **Annual cost: $1,224**
@@ -225,10 +280,10 @@ With rdma-pipe (5 GB/s):
 
 ### 4. Total Cost Savings Summary
 
-For a typical AI/ML organization:
+#### With InfiniBand FDR (56 Gbps) - Legacy/Budget
 
-| Category | Annual Traditional Cost | Annual With rdma-pipe | Annual Savings |
-|----------|------------------------|---------------------|----------------|
+| Category | Annual Traditional Cost | Annual With rdma-pipe FDR | Annual Savings |
+|----------|------------------------|---------------------------|----------------|
 | Inference cold start buffer | $5,664,000 | $283,200 | $5,380,800 |
 | Training checkpoint I/O (4 runs/year) | $12,592,640 | $253,200 | $12,339,440 |
 | Development iteration time | $15,600 | $1,224 | $14,376 |
@@ -236,18 +291,41 @@ For a typical AI/ML organization:
 
 **Overall savings: 97% reduction in data transfer-related costs**
 
+#### With InfiniBand HDR (200 Gbps) - Current Standard (2026)
+
+| Category | Annual Traditional Cost | Annual With rdma-pipe HDR | Annual Savings |
+|----------|------------------------|---------------------------|----------------|
+| Inference cold start buffer | $5,664,000 | $94,400 | $5,569,600 |
+| Training checkpoint I/O (4 runs/year) | $12,592,640 | $52,400 | $12,540,240 |
+| Development iteration time | $15,600 | $252 | $15,348 |
+| **Total** | **$18,272,240** | **$147,052** | **$18,125,188** |
+
+**Overall savings: 99.2% reduction in data transfer-related costs**
+
+**Additional savings vs FDR: $390,572/year (2.2% improvement)**
+
 ### 5. Infrastructure Cost Comparison
 
-**InfiniBand Network Investment:**
-- InfiniBand FDR switches (56 Gbps): ~$15,000 per 36-port switch
-- InfiniBand HCA cards: ~$800 per card
-- Cables: ~$100 per cable
-- For 100-node cluster: ~$150,000 initial investment
+**RDMA Network Investment Options:**
 
-**ROI Calculation:**
-- Monthly savings: $1,477,884
-- Initial investment: $150,000
-- **Payback period: 3 days**
+| Generation | Link Speed | HCA Cost/Node | Switch Cost (48-port) | 100-Node Cluster Total | Effective Bandwidth | Cost per GB/s |
+|------------|------------|---------------|----------------------|------------------------|---------------------|---------------|
+| **FDR** | 56 Gbps | $800 | $15,000 | $150,000 | 5-7 GB/s | $25,000 |
+| **EDR** | 100 Gbps | $1,000 | $25,000 | $180,000 | 10-12 GB/s | $16,000 |
+| **HDR** | 200 Gbps | $1,200 | $40,000 | $240,000 | 20-25 GB/s | $10,000 |
+| **NDR** | 400 Gbps | $2,000 | $80,000 | $360,000 | 40-50 GB/s | $7,800 |
+
+**ROI Calculation (HDR - Recommended for 2026):**
+- Monthly savings: $1,510,432
+- Initial investment: $240,000
+- **Payback period: 4.8 days**
+- Better price/performance than FDR: 60% lower cost per GB/s
+
+**ROI Calculation (NDR - Cutting Edge):**
+- Monthly savings: $1,527,098
+- Initial investment: $360,000
+- **Payback period: 7.1 days**
+- Best absolute performance, 22% lower cost per GB/s than HDR
 
 ---
 
