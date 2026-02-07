@@ -244,6 +244,8 @@ rdma-pipe is exceptionally well-suited for AI/ML workloads.
 
 **📚 Documentation for AI/ML Users:** See **[AI/ML Documentation Index](DOCUMENTATION_INDEX.md)** for complete guide.
 
+**🔬 GPT 5.2 Critique & Advanced Features:** See **[GPT 5.2 Critique](GPT52_CRITIQUE_AND_IMPROVEMENTS.md)** and **[Modern RDMA Features](MODERN_RDMA_FEATURES.md)** for in-depth analysis of gaps and future improvements.
+
 - **[Quick Start Guide](AI_QUICK_START.md)** - Copy-paste examples for common AI/ML workflows
   - Load model weights (LLaMA, GPT, Stable Diffusion, etc.)
   - Transfer training datasets
@@ -251,22 +253,28 @@ rdma-pipe is exceptionally well-suited for AI/ML workloads.
   - Multi-node deployment
   
 - **[Performance Guide](AI_MODEL_LOADING_GUIDE.md)** - Comprehensive technical guide
-  - 10-15x faster model loading compared to traditional methods
+  - 10-125x faster model loading (FDR to NDR hardware)
   - Detailed implementation strategies
   - Deployment patterns and best practices
   - Real-world examples and workflows
   
 - **[Cost Savings Analysis](COST_SAVINGS.md)** - Business case and ROI
-  - 90-98% infrastructure cost savings
-  - $17.7M annual savings for large organizations
-  - 3-day payback period
-  - Detailed ROI calculations
+  - 90-99% infrastructure cost savings
+  - $17.7-18.1M annual savings for large organizations
+  - 3-10 day payback period (depending on hardware)
+  - Detailed ROI calculations for FDR/HDR/NDR
 
 - **[Implementation Plan](IMPLEMENTATION_PLAN.md)** - Roadmap and deployment strategy
   - 3-phase implementation roadmap
   - Technical requirements
   - Success metrics and risk mitigation
   - Next steps checklist
+
+- **[Modern RDMA Features](MODERN_RDMA_FEATURES.md)** - Advanced capabilities
+  - GPUDirect RDMA integration
+  - Multi-rail configurations
+  - Hardware compression/encryption
+  - Software enhancement roadmap
 
 # Alternatives
 
