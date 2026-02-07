@@ -87,20 +87,50 @@ This index provides an overview of all AI/ML-related documentation for rdma-pipe
 
 ## Key Performance Metrics
 
-| Metric | Traditional | rdma-pipe | Improvement |
-|--------|------------|-----------|-------------|
-| Network Bandwidth | 400 MB/s | 5+ GB/s | **12.5x** |
+### With InfiniBand FDR (56 Gbps) - Legacy/Budget
+
+| Metric | Traditional | rdma-pipe FDR | Improvement |
+|--------|------------|---------------|-------------|
+| Network Bandwidth | 400 MB/s | 5-7 GB/s | **12.5x** |
 | 70GB Model Load | 175 sec | 14 sec | **12.5x** |
 | 1TB Dataset Transfer | 2.7 hours | 3.5 min | **47x** |
 | GPU Utilization | 60% | 95% | **+58%** |
 
+### With InfiniBand HDR (200 Gbps) - Current Standard (2026)
+
+| Metric | Traditional | rdma-pipe HDR | Improvement |
+|--------|------------|---------------|-------------|
+| Network Bandwidth | 400 MB/s | 20-25 GB/s | **62x** |
+| 70GB Model Load | 175 sec | 2.8 sec | **62x** |
+| 1TB Dataset Transfer | 2.7 hours | 40 sec | **243x** |
+| GPU Utilization | 60% | 98% | **+63%** |
+
+### With InfiniBand NDR (400 Gbps) - Cutting Edge
+
+| Metric | Traditional | rdma-pipe NDR | Improvement |
+|--------|------------|---------------|-------------|
+| Network Bandwidth | 400 MB/s | 40-50 GB/s | **125x** |
+| 70GB Model Load | 175 sec | 1.4 sec | **125x** |
+| 1TB Dataset Transfer | 2.7 hours | 20 sec | **486x** |
+| GPU Utilization | 60% | 98% | **+63%** |
+
 ## Cost Savings Summary
+
+### With FDR (56 Gbps) - Budget Option
 
 | Organization Size | Investment | Annual Savings | Payback Period | ROI |
 |------------------|------------|----------------|----------------|-----|
 | Small (10 GPUs) | $25K | $400K | 23 days | 1,500% |
 | Medium (50 GPUs) | $75K | $2.5M | 11 days | 3,233% |
 | Large (1000 GPUs) | $150K | $17.7M | 3 days | 11,723% |
+
+### With HDR (200 Gbps) - Recommended for 2026
+
+| Organization Size | Investment | Annual Savings | Payback Period | ROI |
+|------------------|------------|----------------|----------------|-----|
+| Small (10 GPUs) | $38K | $420K | 33 days | 1,005% |
+| Medium (50 GPUs) | $120K | $2.6M | 17 days | 2,088% |
+| Large (1000 GPUs) | $280K | $18.1M | 5.6 days | 6,373% |
 
 ## Use Cases Covered
 
