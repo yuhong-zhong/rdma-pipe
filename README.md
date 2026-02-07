@@ -276,6 +276,12 @@ rdma-pipe is exceptionally well-suited for AI/ML workloads.
   - Hardware compression/encryption
   - Software enhancement roadmap
 
+- **[Benchmarking Guide](BENCHMARKING_GUIDE.md)** - Verify performance claims
+  - Automated cloud infrastructure setup (AWS, Azure, GCP)
+  - Benchmark scripts for FDR/HDR/NDR testing
+  - Results analysis and validation
+  - Step-by-step verification instructions
+
 # Alternatives
 
 NVMEoF - export NVMe devices over Fabrics. Great performance, but exports an entire NVMe namespace.
