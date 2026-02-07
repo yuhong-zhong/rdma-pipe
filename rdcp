@@ -59,6 +59,22 @@ else
     fi
 fi
 
+# Check if source is a directory and -r flag is not set
+if [ "$recursive" = "" ]; then
+    # Check if source is a local directory
+    if [ "$source_host" = "" ] && [ -d "$source_filename" ]; then
+        echo "rdcp: $source_filename: Is a directory (use -r to copy directories)" >&2
+        exit 1
+    fi
+    # For remote sources, we'll check via ssh
+    if [ "$source_host" != "" ]; then
+        if $ssh $ssh_flags $source_host "[ -d \"$source_filename\" ]" 2>/dev/null; then
+            echo "rdcp: $source_filename: Is a directory (use -r to copy directories)" >&2
+            exit 1
+        fi
+    fi
+fi
+
 # If the host is the same as the target, then we can just copy the file
 # locally.  Otherwise, we need to copy it remotely.
 
