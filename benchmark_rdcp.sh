@@ -4,9 +4,13 @@
 #
 # This benchmark tests rdcp performance on a single host, which is useful for:
 # - Testing NVMe storage bandwidth
-# - Measuring file copy performance without network overhead
-# - Validating rdcp single-host optimization (uses regular cp)
+# - Measuring file copy performance using RDMA loopback
+# - Validating rdcp performance optimizations (parallel I/O, O_DIRECT)
 # - Creating baseline performance measurements
+#
+# Note: rdcp now uses RDMA loopback even for localhost-to-localhost copies
+# instead of falling back to regular cp, because the RDMA path has better
+# performance optimizations (parallel I/O, O_DIRECT).
 #
 # Usage: ./benchmark_rdcp.sh [test_dir]
 #   test_dir - Directory to use for tests (default: /tmp/rdcp_bench)

@@ -1,6 +1,17 @@
 # RDCP Benchmark Suite
 
-This benchmark suite measures `rdcp` performance for single-host file and directory copies, which is useful for testing NVMe storage bandwidth and establishing baseline performance.
+This benchmark suite measures `rdcp` performance for single-host file and directory copies using RDMA loopback, which is useful for testing NVMe storage bandwidth and establishing baseline performance.
+
+## Important Note: RDMA Loopback for Local Copies
+
+**As of this version, rdcp uses RDMA loopback even for localhost-to-localhost copies** instead of falling back to regular `cp`. This is because:
+
+- The RDMA path includes performance optimizations (parallel I/O, O_DIRECT) that regular `cp` lacks
+- RDMA loopback performance is better than `cp` on fast storage (NVMe)
+- Parallel I/O can better saturate modern NVMe arrays
+- This provides consistent behavior whether copying locally or remotely
+
+This means the benchmark now measures RDMA loopback performance rather than plain `cp` performance.
 
 ## What It Tests
 
@@ -20,13 +31,14 @@ The benchmark performs the following tests:
 
 ## Why Single-Host Benchmarking?
 
-Single-host benchmarking (copying files locally) is valuable because:
+Single-host benchmarking (copying files locally via RDMA loopback) is valuable because:
 
-- **Eliminates network variables** - Tests pure file I/O performance
-- **Measures storage bandwidth** - Identifies if storage is the bottleneck
-- **Validates rdcp optimization** - On single host, rdcp uses `cp` for efficiency
+- **Tests RDMA loopback performance** - Measures RDMA performance without network latency
+- **Measures storage bandwidth** - Tests if storage can keep up with RDMA transfer rates
+- **Validates rdcp optimizations** - Tests parallel I/O and O_DIRECT optimizations
 - **Creates baseline** - Compare with network RDMA performance to identify bottlenecks
-- **Tests NVMe arrays** - Can saturate fast NVMe storage
+- **Tests NVMe arrays** - Parallel I/O can better saturate fast NVMe storage
+- **Better than cp** - RDMA path has optimizations that regular cp lacks
 
 ## Requirements
 
