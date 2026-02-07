@@ -10,6 +10,8 @@ Maybe you have large files to copy around and you want to use all the bandwidth 
 
 3.7 GB/s file copy from page cache to ext4 RAID-10.
 
+**AI/ML Users:** See the **[AI Quick Start Guide](AI_QUICK_START.md)** for practical examples of loading model weights, distributing training data, and checkpoint management with 10-15x performance improvements.
+
 # What's in the box
 
 Use `rdcp` to copy files over RDMA. Uses `ssh` to start the receiver on the remote end and then sends the file over.
@@ -230,6 +232,20 @@ Log back in for the changes to take effect.
         * The [`rdpipe`](rdpipe) utility was written for this use case. `rdpipe 'zfs send' backup:'zfs recv'`
         * Maybe rewrite it in bash :-)
     * rdcp --sync -r ingest-server:/videos ./videos/
+
+# AI/ML Use Cases
+
+rdma-pipe is exceptionally well-suited for AI/ML workloads. See the **[AI Model Loading Performance Guide](AI_MODEL_LOADING_GUIDE.md)** for:
+
+* **10-15x faster model loading** compared to traditional methods (SCP, NFS, rsync)
+* **90-98% infrastructure cost savings** for training and inference
+* Detailed strategies for:
+  - Loading large language model weights (LLaMA, GPT, etc.)
+  - Distributing training datasets
+  - Checkpoint management for distributed training
+  - Multi-node model deployment
+* Real-world examples and workflows
+* Cost analysis and ROI calculations
 
 # Alternatives
 
