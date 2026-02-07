@@ -237,7 +237,7 @@ Log back in for the changes to take effect.
 
 rdma-pipe is exceptionally well-suited for AI/ML workloads. 
 
-**📚 Documentation for AI/ML Users:**
+**📚 Documentation for AI/ML Users:** See **[AI/ML Documentation Index](DOCUMENTATION_INDEX.md)** for complete guide.
 
 - **[Quick Start Guide](AI_QUICK_START.md)** - Copy-paste examples for common AI/ML workflows
   - Load model weights (LLaMA, GPT, Stable Diffusion, etc.)
@@ -256,6 +256,12 @@ rdma-pipe is exceptionally well-suited for AI/ML workloads.
   - $17.7M annual savings for large organizations
   - 3-day payback period
   - Detailed ROI calculations
+
+- **[Implementation Plan](IMPLEMENTATION_PLAN.md)** - Roadmap and deployment strategy
+  - 3-phase implementation roadmap
+  - Technical requirements
+  - Success metrics and risk mitigation
+  - Next steps checklist
 
 # Alternatives
 
