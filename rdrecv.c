@@ -121,12 +121,19 @@ int main(int argc, char *argv[]) {
       fprintf(stderr, "Error opening file %s (%d)\n", argv[argv_idx], errno);
       return 200;
     }
+    // Hint to kernel: sequential write, don't cache (we won't re-read)
+    posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+    posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+    
     use_parallel_writes = 1;
     // Open 8 parallel file descriptors.
     for (int i = 0; i < 8; i++) {
       fds[i] = open(argv[argv_idx], O_WRONLY | O_DIRECT);
       if (fds[i] < 0) {
         use_parallel_writes = 0;
+      } else {
+        // Hint to kernel: sequential write pattern
+        posix_fadvise(fds[i], 0, 0, POSIX_FADV_SEQUENTIAL);
       }
     }
   }
@@ -345,23 +352,25 @@ int main(int argc, char *argv[]) {
         // We relax the requirements: just need 4K alignment for O_DIRECT.
         if (use_parallel_writes == 1 && total_bytes % 4096 == 0 &&
             msgLen % 4096 == 0 && msgLen >= 1048576) {
-          // Striped parallel write to the file.
-          // Calculate the number of chunks and chunk size.
+          // Striped parallel write to the file using O_DIRECT.
+          // For O_DIRECT, each chunk must be 4K-aligned in size and buffer offset.
           const int num_threads = 8;
-          const ssize_t chunk_size = (msgLen + num_threads - 1) / num_threads;
-          const ssize_t aligned_chunk_size = (chunk_size + 4095) & ~4095; // Round up to 4K
+          const ssize_t chunk_size = msgLen / num_threads;
+          const ssize_t aligned_chunk_size = chunk_size & ~4095; // Round down to 4K
           
           ssize_t buf_written_bytes = 0;
           int error = 0;
 #pragma omp parallel for
           for (int j = 0; j < num_threads; j++) {
             ssize_t offset = j * aligned_chunk_size;
-            if (offset >= msgLen) continue;
-            
             ssize_t bytes_to_write = aligned_chunk_size;
-            if (offset + bytes_to_write > msgLen) {
+            
+            // Last thread handles remaining bytes
+            if (j == num_threads - 1) {
               bytes_to_write = msgLen - offset;
             }
+            
+            if (bytes_to_write == 0) continue;
             
             ssize_t written = 0;
             while (written < bytes_to_write) {
