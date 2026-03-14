@@ -238,18 +238,23 @@ check_port_reachable() {
     local host="$1"
     local test_port="$2"
     echo "Checking if RDMA port $test_port is reachable on $host..."
-    # Try to connect on the port using bash /dev/tcp or nc.
-    # We start rdrecv on the remote side (briefly) to get a real RDMA listen socket,
-    # then test TCP reachability with nc (rdmacm PS_TCP uses TCP ports).
+    # Try to connect on the port using nc.
+    # We start rdrecv on the remote side briefly to open the RDMA listen socket,
+    # then test reachability with nc. The remote command uses a trap to ensure
+    # rdrecv is always cleaned up when the SSH session ends.
     if command -v nc >/dev/null 2>&1; then
-        # Start a brief listener via ssh and test with nc
         local password="rdcheck_port_test_$$"
-        ssh $ssh_flags "$host" "rdrecv $test_port $password >/dev/null 2>&1 & sleep 3; kill \$! 2>/dev/null" &
+        # Start rdrecv with a self-cleanup trap: it runs for at most 5 seconds
+        ssh $ssh_flags "$host" \
+            "rdrecv_pid=; trap 'kill \$rdrecv_pid 2>/dev/null' EXIT INT TERM; \
+             rdrecv $test_port $password >/dev/null 2>&1 & rdrecv_pid=\$!; sleep 5" &
         local ssh_pid=$!
         sleep 1
-        if nc -z -w 3 "${host##*@}" "$test_port" 2>/dev/null; then
+        local nc_result=0
+        nc -z -w 3 "${host##*@}" "$test_port" 2>/dev/null || nc_result=$?
+        wait $ssh_pid 2>/dev/null
+        if [ $nc_result -eq 0 ]; then
             pass "Port $test_port is reachable on $host"
-            wait $ssh_pid 2>/dev/null
             return 0
         else
             fail "Port $test_port is NOT reachable on $host."
@@ -257,7 +262,6 @@ check_port_reachable() {
             info "Open these ports in the firewall on $host:"
             info "  iptables -A INPUT -p tcp --dport 10000:19999 -j ACCEPT"
             info "  firewall-cmd --add-port=10000-19999/tcp --permanent"
-            wait $ssh_pid 2>/dev/null
             return 1
         fi
     else

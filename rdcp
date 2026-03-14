@@ -170,13 +170,13 @@ password=$(head -c 12 /dev/urandom | od -An -t x | tr -d ' ')
 
 # If any of the programs fail, kill them all to avoid leaving zombies.
 
-function cleanup() {
+cleanup() {
     kill -HUP $recv_pid $send_pid 2>/dev/null
 }
 trap cleanup EXIT
 
 # Wait for both background processes and report RDMA errors helpfully.
-function rdma_wait() {
+rdma_wait() {
     local diag_host="${1:-}"
     wait
     local result=$?
