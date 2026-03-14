@@ -59,6 +59,36 @@ else
     fi
 fi
 
+# Check if source is a directory and -r flag is not set
+if [ "$recursive" = "" ]; then
+    # Check if source is a local directory
+    if [ "$source_host" = "" ]; then
+        if [ -d "$source_filename" ]; then
+            echo "rdcp: $source_filename: Is a directory (use -r to copy directories)" >&2
+            exit 1
+        elif [ ! -e "$source_filename" ] && [ "$source_filename" != "/dev/stdin" ]; then
+            echo "rdcp: $source_filename: No such file or directory" >&2
+            exit 1
+        fi
+    fi
+    # For remote sources, we'll check via ssh
+    if [ "$source_host" != "" ]; then
+        ssh_check_output=$($ssh $ssh_flags $source_host "if [ -d \"$source_filename\" ]; then echo DIR; elif [ -e \"$source_filename\" ]; then echo FILE; else echo NOTFOUND; fi" 2>&1)
+        ssh_check_status=$?
+        if [ $ssh_check_status -ne 0 ]; then
+            echo "rdcp: Failed to connect to $source_host" >&2
+            exit 1
+        fi
+        if [ "$ssh_check_output" = "DIR" ]; then
+            echo "rdcp: $source_filename: Is a directory (use -r to copy directories)" >&2
+            exit 1
+        elif [ "$ssh_check_output" = "NOTFOUND" ]; then
+            echo "rdcp: $source_filename: No such file or directory" >&2
+            exit 1
+        fi
+    fi
+fi
+
 # If the host is the same as the target, then we can just copy the file
 # locally.  Otherwise, we need to copy it remotely.
 
