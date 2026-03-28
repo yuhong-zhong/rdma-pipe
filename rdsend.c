@@ -1,5 +1,5 @@
 /*
- * cc -o rdsend rdsend.c -lrdmacm -libverbs
+ * cc -o rdsend rdsend.c -libverbs -fopenmp
  *
  * usage:
  * rdsend <server> <port> <key>
@@ -7,6 +7,7 @@
  * Reads data from stdin and RDMA sends it to the given server and port,
  * authenticating with the key.
  *
+ * Uses a TCP socket for QP handshake to avoid ibacm dependency.
  */
 #define _GNU_SOURCE
 
@@ -22,181 +23,120 @@
 #include <time.h>
 #include <unistd.h>
 
-#include <rdma/rdma_cma.h>
-// Use zstd to compress data on the fly.
-// #include <zstd.h>
-// Use OpenMP to parallelize compression and IO.
+#include <infiniband/verbs.h>
 #include <omp.h>
 
 enum {
   RESOLVE_TIMEOUT_MS = 5000,
 };
 
-struct pdata {
-  uint64_t buf_va;
-  uint32_t buf_rkey;
+struct qp_info {
+  uint32_t qpn;
+  uint32_t psn;
+  union ibv_gid gid;
 };
 
 void usage() {
   fprintf(stderr, "USAGE: rdsend [-v] <server> <port> <key> [filename]\n");
 }
 
-int rconnect(char *host, char *port, struct rdma_event_channel *cm_channel,
-             struct rdma_cm_id **cm_id, struct ibv_mr **mr, struct ibv_cq **cq,
-             struct ibv_pd **pd, struct ibv_comp_channel **comp_chan, void *buf,
-             uint32_t buf_len, struct pdata *server_pdata) {
-  struct rdma_conn_param conn_param = {};
-  struct addrinfo *res, *t;
-  struct addrinfo hints = {.ai_family = AF_INET, .ai_socktype = SOCK_STREAM};
-  struct ibv_qp_init_attr qp_attr = {};
-  int n;
-  struct rdma_cm_event *event;
-  int err;
-
-  err = rdma_create_id(cm_channel, cm_id, NULL, RDMA_PS_TCP);
-  if (err)
-    return err;
-
-  n = getaddrinfo(host, port, &hints, &res);
-  if (n < 0)
-    return 102;
-
-  /* Connect to remote end */
-
-  for (t = res; t; t = t->ai_next) {
-    err = rdma_resolve_addr(*cm_id, NULL, t->ai_addr, RESOLVE_TIMEOUT_MS);
-    if (!err)
-      break;
-  }
-  if (err)
-    return 103;
-
-  err = rdma_get_cm_event(cm_channel, &event);
-  if (err)
-    return 104;
-
-  if (event->event != RDMA_CM_EVENT_ADDR_RESOLVED)
-    return 105;
-
-  rdma_ack_cm_event(event);
-
-  err = rdma_resolve_route(*cm_id, RESOLVE_TIMEOUT_MS);
-  if (err)
-    return 106;
-
-  err = rdma_get_cm_event(cm_channel, &event);
-  if (err)
-    return 107;
-
-  if (event->event != RDMA_CM_EVENT_ROUTE_RESOLVED)
-    return 108;
-
-  rdma_ack_cm_event(event);
-
-  /* Create IB buffers and CQs and things */
-
-  *pd = ibv_alloc_pd((*cm_id)->verbs);
-  if (!*pd)
-    return 109;
-
-  *comp_chan = ibv_create_comp_channel((*cm_id)->verbs);
-  if (!*comp_chan)
-    return 110;
-
-  *cq = ibv_create_cq((*cm_id)->verbs, 2, NULL, *comp_chan, 0);
-  if (!*cq)
-    return 111;
-
-  if (ibv_req_notify_cq(*cq, 0))
-    return 112;
-
-  *mr = ibv_reg_mr(*pd, buf, buf_len, IBV_ACCESS_LOCAL_WRITE);
-  if (!*mr)
-    return 99;
-
-  // qp_attr.cap.max_send_wr = 2;
-  // qp_attr.cap.max_send_sge = 1;
-  // qp_attr.cap.max_recv_wr = 1;
-  // qp_attr.cap.max_recv_sge = 1;
-
-  qp_attr.send_cq = *cq;
-  qp_attr.recv_cq = *cq;
-  qp_attr.qp_type = IBV_QPT_RC;
-
-  err = rdma_create_qp(*cm_id, *pd, &qp_attr);
-  if (err)
-    return 114;
-
-  conn_param.initiator_depth = 1;
-  conn_param.retry_count = 7;
-
-  err = rdma_connect(*cm_id, &conn_param);
-  if (err) {
-    fprintf(stderr, "rdma_connect() error: %d\n", errno);
-    return 115;
-  }
-
-  /* Connect! */
-
-  err = rdma_get_cm_event(cm_channel, &event);
-  if (err) {
-    return 116;
-  }
-
-  if (event->event != RDMA_CM_EVENT_ESTABLISHED) {
-    rdma_ack_cm_event(event);
-    return 117;
-  }
-
-  memcpy(server_pdata, event->param.conn.private_data, sizeof(struct pdata));
-  rdma_ack_cm_event(event);
-
-  return 0;
+// Returns 1 if GID at (devname, port, gidx) is of type "RoCE v2"
+static int gid_is_roce_v2(const char *devname, uint8_t port, int gidx) {
+  char path[256];
+  char typebuf[32] = {};
+  snprintf(path, sizeof(path),
+           "/sys/class/infiniband/%s/ports/%d/gid_attrs/types/%d",
+           devname, port, gidx);
+  FILE *f = fopen(path, "r");
+  if (!f) return 0;
+  if (!fgets(typebuf, sizeof(typebuf), f)) { fclose(f); return 0; }
+  fclose(f);
+  // strip trailing newline
+  typebuf[strcspn(typebuf, "\n")] = '\0';
+  return strcmp(typebuf, "RoCE v2") == 0;
 }
 
-int rdisconnect(struct rdma_event_channel *cm_channel, struct rdma_cm_id *cm_id,
-                struct ibv_mr *mr, struct ibv_cq *cq, struct ibv_pd *pd,
-                struct ibv_comp_channel *comp_chan) {
-  int err;
-  err = rdma_disconnect(cm_id);
-  if (err) {
-    return 201;
+// Find the ibv_context and port for the device whose RoCEv2 GID matches the
+// local IP used to route to target_ip.
+struct ibv_context *find_rdma_device(const char *target_ip, uint8_t *port_out,
+                                     int *gid_idx_out, union ibv_gid *gid_out) {
+  // Find which local IP routes to target
+  int sock = socket(AF_INET, SOCK_DGRAM, 0);
+  if (sock < 0) return NULL;
+  struct sockaddr_in remote = {
+      .sin_family = AF_INET,
+      .sin_port = htons(1),
+  };
+  inet_aton(target_ip, &remote.sin_addr);
+  if (connect(sock, (struct sockaddr *)&remote, sizeof(remote)) < 0) {
+    close(sock);
+    return NULL;
   }
-  rdma_destroy_qp(cm_id);
-  if (err)
-    return 203;
-  err = ibv_dereg_mr(mr);
-  if (err)
-    return 204;
-  err = ibv_destroy_cq(cq);
-  if (err)
-    return 205;
-  err = ibv_dealloc_pd(pd);
-  if (err)
-    return 206;
-  err = ibv_destroy_comp_channel(comp_chan);
-  if (err)
-    return 207;
-  err = rdma_destroy_id(cm_id);
-  if (err)
-    return 208;
+  struct sockaddr_in local;
+  socklen_t slen = sizeof(local);
+  getsockname(sock, (struct sockaddr *)&local, &slen);
+  close(sock);
+  uint32_t local_ip = local.sin_addr.s_addr; // network byte order
 
-  return 0;
+  fprintf(stderr, "DEBUG: local_ip = %08x (looking for RoCEv2 GID)\n", local_ip);
+
+  int num_devices;
+  struct ibv_device **devlist = ibv_get_device_list(&num_devices);
+  if (!devlist) return NULL;
+
+  for (int i = 0; i < num_devices; i++) {
+    fprintf(stderr, "DEBUG: checking device %s\n", ibv_get_device_name(devlist[i]));
+    struct ibv_context *ctx = ibv_open_device(devlist[i]);
+    if (!ctx) continue;
+
+    struct ibv_device_attr attr;
+    if (ibv_query_device(ctx, &attr)) {
+      ibv_close_device(ctx);
+      continue;
+    }
+
+    for (uint8_t port = 1; port <= attr.phys_port_cnt; port++) {
+      struct ibv_port_attr pattr;
+      if (ibv_query_port(ctx, port, &pattr)) continue;
+      if (pattr.state != IBV_PORT_ACTIVE) continue;
+
+      for (int gidx = 0; gidx < pattr.gid_tbl_len; gidx++) {
+        union ibv_gid gid;
+        if (ibv_query_gid(ctx, port, gidx, &gid)) continue;
+        // RoCEv2 IPv4-mapped GID: bytes 0-9 are zero, 10-11 are 0xFF,
+        // bytes 12-15 are the IPv4 address.
+        int is_roce_v2 = gid_is_roce_v2(ibv_get_device_name(devlist[i]), port, gidx);
+        if (gid.raw[10] == 0xFF && gid.raw[11] == 0xFF) {
+          uint32_t gid_ip;
+          memcpy(&gid_ip, &gid.raw[12], 4);
+          fprintf(stderr, "DEBUG:  gid[%d]: ip=%08x local=%08x roce_v2=%d\n",
+                  gidx, gid_ip, local_ip, is_roce_v2);
+          if (gid_ip == local_ip && is_roce_v2) {
+            *port_out = port;
+            *gid_idx_out = gidx;
+            *gid_out = gid;
+            ibv_free_device_list(devlist);
+            return ctx;
+          }
+        }
+      }
+    }
+    ibv_close_device(ctx);
+  }
+  ibv_free_device_list(devlist);
+  return NULL;
 }
 
 int max(int a, int b) { return a < b ? b : a; }
 
 int main(int argc, char *argv[]) {
-  struct pdata server_pdata;
-
-  struct rdma_event_channel *cm_channel = NULL;
-  struct rdma_cm_id *cm_id = NULL;
-
+  struct ibv_context *ctx = NULL;
   struct ibv_pd *pd = NULL;
   struct ibv_comp_channel *comp_chan = NULL;
   struct ibv_cq *cq = NULL;
   struct ibv_cq *evt_cq = NULL;
   struct ibv_mr *mr = NULL;
+  struct ibv_qp *qp = NULL;
   struct ibv_sge sge, rsge;
   struct ibv_send_wr send_wr = {};
   struct ibv_send_wr *bad_send_wr;
@@ -211,7 +151,6 @@ int main(int argc, char *argv[]) {
   struct timespec now, tmstart;
   double seconds;
 
-  // int64_t read_bytes;
   uint64_t total_bytes, buf_read_bytes;
   int wr_id = 1, more_to_send = 1;
   uint32_t buf_size = 16 * 524288;
@@ -223,8 +162,6 @@ int main(int argc, char *argv[]) {
   uint32_t keylen;
 
   int verbose = 0;
-
-  int retries = 0;
   int argv_idx = 1;
 
   if (argc < 4) {
@@ -239,7 +176,6 @@ int main(int argc, char *argv[]) {
 
   host = argv[argv_idx++];
   ports = argv[argv_idx++];
-
   port = atoi(ports);
 
   if (port < 1 || port > 65535) {
@@ -257,16 +193,13 @@ int main(int argc, char *argv[]) {
   int fds[16];
   if (argv_idx < argc) {
     fd = open(argv[argv_idx], O_RDONLY);
-    // Ask kernel to read the file to page cache.
-    // posix_fadvise(fd, 0, 0, POSIX_FADV_WILLNEED);
     if (fd < 0) {
       fprintf(stderr, "Error opening file %s\n", argv[argv_idx]);
       return 200;
     }
-    // Open 16 parallel file descriptors.
     for (int i = 0; i < 16; i++) {
       fds[i] = open(argv[argv_idx], O_RDONLY | O_DIRECT);
-      posix_fadvise (fds[i], 0, 0, POSIX_FADV_NOREUSE);
+      posix_fadvise(fds[i], 0, 0, POSIX_FADV_NOREUSE);
       if (fds[i] < 0) {
         fprintf(stderr, "Error opening file %s\n", argv[argv_idx]);
         return 200;
@@ -279,31 +212,141 @@ int main(int argc, char *argv[]) {
     return 113;
   }
   buf2 = (uint32_t *)(((char *)buf) + buf_size);
-
-  /* RDMA CM */
-  cm_channel = rdma_create_event_channel();
-  if (!cm_channel)
-    return 101;
-
   buf_len = buf_size * 2 + 4;
 
-  while (0 != rconnect(host, ports, cm_channel, &cm_id, &mr, &cq, &pd,
-                       &comp_chan, buf, buf_len, &server_pdata)) {
+  // Find RDMA device for target
+  uint8_t port_num;
+  int gid_idx;
+  union ibv_gid local_gid;
+  ctx = find_rdma_device(host, &port_num, &gid_idx, &local_gid);
+  if (!ctx) {
+    fprintf(stderr, "No RDMA device found for target %s\n", host);
+    return 101;
+  }
+
+  pd = ibv_alloc_pd(ctx);
+  if (!pd) return 109;
+
+  comp_chan = ibv_create_comp_channel(ctx);
+  if (!comp_chan) return 110;
+
+  cq = ibv_create_cq(ctx, 2, NULL, comp_chan, 0);
+  if (!cq) return 111;
+
+  if (ibv_req_notify_cq(cq, 0)) return 112;
+
+  mr = ibv_reg_mr(pd, buf, buf_len, IBV_ACCESS_LOCAL_WRITE);
+  if (!mr) return 99;
+
+  struct ibv_qp_init_attr qp_init = {
+      .send_cq = cq,
+      .recv_cq = cq,
+      .qp_type = IBV_QPT_RC,
+      .cap = {.max_send_wr = 2,
+              .max_send_sge = 1,
+              .max_recv_wr = 1,
+              .max_recv_sge = 1},
+  };
+  qp = ibv_create_qp(pd, &qp_init);
+  if (!qp) return 114;
+
+  // Move QP to INIT
+  struct ibv_qp_attr init_attr = {
+      .qp_state = IBV_QPS_INIT,
+      .pkey_index = 0,
+      .port_num = port_num,
+      .qp_access_flags = 0,
+  };
+  if (ibv_modify_qp(qp, &init_attr,
+                    IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT |
+                        IBV_QP_ACCESS_FLAGS))
+    return 115;
+
+  // Connect via TCP and exchange QP info, with retry
+  int tcp_sock = -1;
+  int retries = 0;
+  while (tcp_sock < 0) {
+    tcp_sock = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in addr = {
+        .sin_family = AF_INET,
+        .sin_port = htons(port),
+    };
+    inet_aton(host, &addr.sin_addr);
+    if (connect(tcp_sock, (struct sockaddr *)&addr, sizeof(addr)) == 0) break;
+    close(tcp_sock);
+    tcp_sock = -1;
     retries++;
     if (retries > 300) {
       fprintf(stderr, "Connection timed out\n");
       return 199;
     }
-    rdisconnect(cm_channel, cm_id, mr, cq, pd, comp_chan);
     nanosleep((const struct timespec[]){{0, 10000000L}}, NULL);
   }
 
-  /* Prepost */
+  uint32_t local_psn = (uint32_t)(lrand48() & 0xFFFFFF);
+  struct qp_info local_info = {
+      .qpn = qp->qp_num,
+      .psn = local_psn,
+      .gid = local_gid,
+  };
+  struct qp_info remote_info;
 
-  sge.addr = (uintptr_t)buf;
-  sge.length = buf_size;
-  sge.lkey = mr->lkey;
+  // rdrecv sends first, then waits for ours
+  ssize_t n = read(tcp_sock, &remote_info, sizeof(remote_info));
+  if (n != sizeof(remote_info)) {
+    fprintf(stderr, "TCP handshake read failed\n");
+    return 116;
+  }
+  n = write(tcp_sock, &local_info, sizeof(local_info));
+  if (n != sizeof(local_info)) {
+    fprintf(stderr, "TCP handshake write failed\n");
+    return 117;
+  }
+  close(tcp_sock);
 
+  // Move QP to RTR
+  struct ibv_qp_attr rtr_attr = {
+      .qp_state = IBV_QPS_RTR,
+      .path_mtu = IBV_MTU_1024,
+      .dest_qp_num = remote_info.qpn,
+      .rq_psn = remote_info.psn,
+      .max_dest_rd_atomic = 1,
+      .min_rnr_timer = 12,
+      .ah_attr =
+          {
+              .is_global = 1,
+              .grh =
+                  {
+                      .dgid = remote_info.gid,
+                      .sgid_index = gid_idx,
+                      .hop_limit = 64,
+                  },
+              .sl = 0,
+              .port_num = port_num,
+          },
+  };
+  if (ibv_modify_qp(qp, &rtr_attr,
+                    IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU |
+                        IBV_QP_DEST_QPN | IBV_QP_RQ_PSN |
+                        IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER))
+    return 118;
+
+  // Move QP to RTS
+  struct ibv_qp_attr rts_attr = {
+      .qp_state = IBV_QPS_RTS,
+      .timeout = 14,
+      .retry_cnt = 7,
+      .rnr_retry = 7,
+      .sq_psn = local_psn,
+      .max_rd_atomic = 1,
+  };
+  if (ibv_modify_qp(qp, &rts_attr,
+                    IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
+                        IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN |
+                        IBV_QP_MAX_QP_RD_ATOMIC))
+    return 119;
+
+  /* Prepost recv */
   rsge.addr = (uintptr_t)(((char *)buf) + 2 * buf_size);
   rsge.length = 4;
   rsge.lkey = mr->lkey;
@@ -316,10 +359,8 @@ int main(int argc, char *argv[]) {
   total_bytes = 0;
 
   memcpy((void *)buf, key, keylen + 1);
-
   buf_read_bytes = keylen + 1;
   total_bytes = 0;
-
   more_to_send = 1;
 
   while (more_to_send) {
@@ -327,7 +368,7 @@ int main(int argc, char *argv[]) {
       more_to_send = 0;
     }
 
-    if (ibv_post_recv(cm_id->qp, &recv_wr, &bad_recv_wr))
+    if (ibv_post_recv(qp, &recv_wr, &bad_recv_wr))
       return 1;
 
     sge.addr = (uintptr_t)buf;
@@ -339,10 +380,8 @@ int main(int argc, char *argv[]) {
     send_wr.send_flags = IBV_SEND_SIGNALED;
     send_wr.sg_list = &sge;
     send_wr.num_sge = 1;
-    send_wr.wr.rdma.rkey = ntohl(server_pdata.buf_rkey);
-    send_wr.wr.rdma.remote_addr = ntohl(server_pdata.buf_va);
 
-    if (ibv_post_send(cm_id->qp, &send_wr, &bad_send_wr))
+    if (ibv_post_send(qp, &send_wr, &bad_send_wr))
       return 1;
 
     tmp = buf;
@@ -350,65 +389,41 @@ int main(int argc, char *argv[]) {
     buf2 = tmp;
 
     if (fd != STDIN_FILENO) {
-      // Do a striped parallel read from fd.
-      // Parallel for loop to read the bytes.
       buf_read_bytes = 0;
 #pragma omp parallel for
       for (int i = 0; i < 8; i++) {
-        // Read 1 MiB from fd.
-        // seek to the correct position in the file.
-        // Last block ended at total_bytes.
         size_t seek_pos = total_bytes + i * 1048576;
         lseek(fds[i], seek_pos, SEEK_SET);
         int read_bytes = read(fds[i], ((void *)buf) + i * 1048576, 1048576);
         if (read_bytes > 0) {
-// Atomic add to buf_read_bytes.
 #pragma omp atomic
           buf_read_bytes += read_bytes;
-          // Compress the data with zstd.
-          // int compressed_size = ZSTD_compress(((void *)(buf2 + 1)) + i *
-          // 524288,
-          //                                     524288, ((void *)(buf + 1)) + i
-          //                                     * 524288, read_bytes, 1);
         }
       }
     } else {
       buf_read_bytes = max(0, read(fd, buf, 16 * 524288));
-      // while (read_bytes && buf_read_bytes < buf_size-4) {
-      // 	read_bytes = read(STDIN_FILENO, ((void*)(&buf[1])) +
-      // buf_read_bytes, buf_size-4-buf_read_bytes); 	buf_read_bytes +=
-      // read_bytes;
-      // }
     }
-    // fprintf(stderr, "buf_read_bytes: %ld\n", buf_read_bytes);
-    // fprintf(stderr, "buf[(buf_size/4) - 1]: %d\n", buf[(buf_size/4) - 1]);
-    // fprintf(stderr, "%d %d %d\n", read_bytes, buf_read_bytes,
-    // buf[(buf_size/4) - 1]);
     total_bytes += buf_read_bytes;
 
-    /* Wait for a response */
-
+    /* Wait for send completion */
     if (ibv_get_cq_event(comp_chan, &evt_cq, &cq_context))
       return 2;
-
     if (ibv_req_notify_cq(cq, 0))
       return 3;
-
     if (ibv_poll_cq(cq, 1, &wc) != 1)
       return 4;
-
-    if (wc.status != IBV_WC_SUCCESS)
+    if (wc.status != IBV_WC_SUCCESS) {
+      fprintf(stderr, "send WC error: %s\n", ibv_wc_status_str(wc.status));
       return 5;
+    }
 
+    /* Wait for recv completion (ACK from rdrecv) */
     if (ibv_get_cq_event(comp_chan, &evt_cq, &cq_context))
       return 6;
-
     if (ibv_req_notify_cq(cq, 0))
       return 7;
-
     if (ibv_poll_cq(cq, 1, &wc) != 1)
       return 8;
-
     if (wc.status != IBV_WC_SUCCESS)
       return 9;
 
@@ -424,8 +439,12 @@ int main(int argc, char *argv[]) {
 
   ibv_ack_cq_events(cq, event_count);
 
-  rdisconnect(cm_channel, cm_id, mr, cq, pd, comp_chan);
-  rdma_destroy_event_channel(cm_channel);
+  ibv_destroy_qp(qp);
+  ibv_dereg_mr(mr);
+  ibv_destroy_cq(cq);
+  ibv_dealloc_pd(pd);
+  ibv_destroy_comp_channel(comp_chan);
+  ibv_close_device(ctx);
 
   return 0;
 }
