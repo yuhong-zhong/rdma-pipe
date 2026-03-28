@@ -161,7 +161,7 @@ else
         $ssh $ssh_flags $target_host rdrecv $verbose $port $password "$target_filename" &
         recv_pid=$!
         # send from source filename
-        rdsend $verbose $rdma_target_host $port $password < "$source_filename" &
+        rdsend $verbose $rdma_target_host $port $password "$source_filename" &
         send_pid=$!
         wait
     elif [ "$target_host" = "" ]; then

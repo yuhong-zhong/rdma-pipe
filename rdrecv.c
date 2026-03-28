@@ -122,7 +122,7 @@ int main(int argc, char *argv[]) {
   struct sockaddr_in sin;
 
   uint32_t *buf, *buf2, *tmp;
-  uint32_t buf_size = 16 * 524288;
+  uint32_t buf_size = 64 * 524288;
 
   int err;
   uint32_t event_count = 0;
@@ -297,7 +297,7 @@ int main(int argc, char *argv[]) {
   // Move QP to RTR
   struct ibv_qp_attr rtr_attr = {
       .qp_state = IBV_QPS_RTR,
-      .path_mtu = IBV_MTU_1024,
+      .path_mtu = IBV_MTU_4096,
       .dest_qp_num = remote_info.qpn,
       .rq_psn = remote_info.psn,
       .max_dest_rd_atomic = 1,
@@ -413,7 +413,7 @@ int main(int argc, char *argv[]) {
       }
       if (i == 0) {
         if (use_parallel_writes == 0 || total_bytes % 4096 != 0 ||
-            msgLen != 8 * 1048576) {
+            msgLen != buf_size) {
           lseek(fd, total_bytes, SEEK_SET);
           ssize_t res = write(fd, cbuf, msgLen);
           while (res < msgLen) {
@@ -431,12 +431,13 @@ int main(int argc, char *argv[]) {
           }
           ssize_t buf_written_bytes = 0;
           int error = 0;
+          size_t wchunk = buf_size / 8;
 #pragma omp parallel for
           for (int j = 0; j < 8; j++) {
-            lseek(fds[j], total_bytes + j * 1048576, SEEK_SET);
+            lseek(fds[j], total_bytes + j * wchunk, SEEK_SET);
             ssize_t res = 0;
-            while (res < 1048576) {
-              res += write(fds[j], cbuf + j * 1048576 + res, 1048576 - res);
+            while (res < (ssize_t)wchunk) {
+              res += write(fds[j], cbuf + j * wchunk + res, wchunk - res);
             }
 #pragma omp atomic
             buf_written_bytes += res;

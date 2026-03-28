@@ -153,7 +153,7 @@ int main(int argc, char *argv[]) {
 
   uint64_t total_bytes, buf_read_bytes;
   int wr_id = 1, more_to_send = 1;
-  uint32_t buf_size = 16 * 524288;
+  uint32_t buf_size = 64 * 524288;
   uint32_t buf_len = 0;
 
   char *host, *ports;
@@ -307,7 +307,7 @@ int main(int argc, char *argv[]) {
   // Move QP to RTR
   struct ibv_qp_attr rtr_attr = {
       .qp_state = IBV_QPS_RTR,
-      .path_mtu = IBV_MTU_1024,
+      .path_mtu = IBV_MTU_4096,
       .dest_qp_num = remote_info.qpn,
       .rq_psn = remote_info.psn,
       .max_dest_rd_atomic = 1,
@@ -389,19 +389,10 @@ int main(int argc, char *argv[]) {
     buf2 = tmp;
 
     if (fd != STDIN_FILENO) {
-      buf_read_bytes = 0;
-#pragma omp parallel for
-      for (int i = 0; i < 8; i++) {
-        size_t seek_pos = total_bytes + i * 1048576;
-        lseek(fds[i], seek_pos, SEEK_SET);
-        int read_bytes = read(fds[i], ((void *)buf) + i * 1048576, 1048576);
-        if (read_bytes > 0) {
-#pragma omp atomic
-          buf_read_bytes += read_bytes;
-        }
-      }
+      ssize_t r = pread(fds[0], buf, buf_size, total_bytes);
+      buf_read_bytes = r > 0 ? (uint64_t)r : 0;
     } else {
-      buf_read_bytes = max(0, read(fd, buf, 16 * 524288));
+      buf_read_bytes = max(0, read(fd, buf, buf_size));
     }
     total_bytes += buf_read_bytes;
 
