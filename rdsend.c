@@ -24,7 +24,6 @@
 #include <unistd.h>
 
 #include <infiniband/verbs.h>
-#include <omp.h>
 
 enum {
   RESOLVE_TIMEOUT_MS = 5000,
@@ -153,7 +152,9 @@ int main(int argc, char *argv[]) {
 
   uint64_t total_bytes, buf_read_bytes;
   int wr_id = 1, more_to_send = 1;
-  uint32_t buf_size = 64 * 524288;
+  uint32_t buf_size = 32 * 1024 * 1024;
+  const char *bs_env = getenv("RDMA_BUF_SIZE");
+  if (bs_env) buf_size = (uint32_t)atoi(bs_env) * 1024 * 1024;
   uint32_t buf_len = 0;
 
   char *host, *ports;

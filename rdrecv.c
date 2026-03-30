@@ -7,6 +7,11 @@
  *
  * Waits for client to connect to given port and authenticate with the key.
  * Uses a TCP socket for QP handshake to avoid ibacm dependency.
+ *
+ * Environment variables:
+ *   RDMA_BUF_SIZE   - buffer size in MB (default 32)
+ *   RDMA_RING_SIZE  - number of ring slots (default 4); allows up to
+ *                     RDMA_RING_SIZE-1 io_uring writes in flight at once
  */
 #define _GNU_SOURCE
 
@@ -37,8 +42,6 @@ void usage() {
 }
 
 void wrongkey() { fprintf(stderr, "Wrong key received\n"); }
-
-int max(int a, int b) { return a < b ? b : a; }
 
 // Returns 1 if GID at (devname, port, gidx) is of type "RoCE v2"
 static int gid_is_roce_v2(const char *devname, uint8_t port, int gidx) {
@@ -122,15 +125,12 @@ int main(int argc, char *argv[]) {
 
   struct sockaddr_in sin;
 
-  uint32_t *buf, *buf2, *tmp;
-  uint32_t buf_size = 64 * 524288;
-
   int err;
   uint32_t event_count = 0;
 
   int port;
-  char *key, *cbuf, *ports;
-  uint32_t keylen, keyIdx = 0, i = 0;
+  char *key, *ports;
+  uint32_t keylen, keyIdx = 0;
 
   int verbose = 0;
   int argv_idx = 1;
@@ -159,8 +159,33 @@ int main(int argc, char *argv[]) {
   key = argv[argv_idx++];
   keylen = strlen(key);
 
+  /* Buffer and ring sizing from environment */
+  uint32_t buf_size = 32 * 1024 * 1024;
+  const char *bs_env = getenv("RDMA_BUF_SIZE");
+  if (bs_env) buf_size = (uint32_t)atoi(bs_env) * 1024 * 1024;
+
+  uint32_t ring_size = 4;
+  const char *rs_env = getenv("RDMA_RING_SIZE");
+  if (rs_env) ring_size = (uint32_t)atoi(rs_env);
+  if (ring_size < 2) ring_size = 2;
+
+  /* Allocate ring slots as one contiguous pinned region */
+  char *ring_base;
+  if (posix_memalign((void **)&ring_base, 4096, (size_t)buf_size * ring_size)) {
+    perror("posix_memalign failed");
+    return 1;
+  }
+
+  void **slots = malloc(ring_size * sizeof(void *));
+  int  *slot_pending = calloc(ring_size, sizeof(int));
+  if (!slots || !slot_pending) { perror("malloc"); return 1; }
+  for (uint32_t s = 0; s < ring_size; s++)
+    slots[s] = ring_base + (size_t)s * buf_size;
+
+  int recv_slot = 0;   /* slot data just arrived into */
+  int next_recv = 1 % (int)ring_size; /* slot to post next recv into */
+
   int use_uring = 0;
-  int pending_uring_write = 0;
   struct io_uring ring;
 
   int fd = STDOUT_FILENO;
@@ -179,7 +204,8 @@ int main(int argc, char *argv[]) {
 
     struct stat st;
     if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode)) {
-      if (io_uring_queue_init(4, &ring, 0) == 0) {
+      /* ring_size entries in the SQ: one per in-flight write */
+      if (io_uring_queue_init(ring_size, &ring, 0) == 0) {
         use_uring = 1;
       }
     }
@@ -235,13 +261,7 @@ int main(int argc, char *argv[]) {
 
   if (ibv_req_notify_cq(cq, 0)) return 1;
 
-  if (posix_memalign((void *)&buf, 4096, buf_size * 2)) {
-    perror("posix_memalign failed");
-    return 1;
-  }
-  buf2 = ((void *)buf) + buf_size;
-
-  mr = ibv_reg_mr(pd, buf, buf_size * 2,
+  mr = ibv_reg_mr(pd, ring_base, (size_t)buf_size * ring_size,
                   IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
                       IBV_ACCESS_REMOTE_WRITE);
   if (!mr) return 1;
@@ -270,8 +290,8 @@ int main(int argc, char *argv[]) {
                           IBV_QP_ACCESS_FLAGS);
   if (err) return err;
 
-  /* Post receive buffer before moving to RTR */
-  sge.addr = (uintptr_t)buf2;
+  /* Post initial receive into slot 0 */
+  sge.addr = (uintptr_t)slots[0];
   sge.length = buf_size;
   sge.lkey = mr->lkey;
 
@@ -351,44 +371,28 @@ int main(int argc, char *argv[]) {
   send_wr.num_sge = 1;
 
   ssize_t total_bytes = 0;
-  uint32_t bufMsgLen = 0;
-  uint32_t buf2MsgLen = 0;
 
   while (1) {
-    /* Wait for receive completion */
+    /* Wait for receive completion into slots[recv_slot] */
     if (ibv_get_cq_event(comp_chan, &evt_cq, &cq_context))
       return 1;
-
     if (ibv_req_notify_cq(cq, 0))
       return 2;
-
     if (ibv_poll_cq(cq, 1, &wc) < 1)
       return 3;
-
     if (wc.status != IBV_WC_SUCCESS) {
       fprintf(stderr, "%s\n", ibv_wc_status_str(wc.status));
       return 4;
     }
 
-    buf2MsgLen = wc.byte_len;
-
-    /* Flip buffers: buf gets the received data, buf2 becomes free */
-    tmp = buf;
-    buf = buf2;
-    buf2 = tmp;
-
-    uint32_t tmpLen = bufMsgLen;
-    bufMsgLen = buf2MsgLen;
-    buf2MsgLen = tmpLen;
-
-    uint32_t msgLen = bufMsgLen;
+    uint32_t msgLen = wc.byte_len;
 
     /*
-     * buf2 (now the previously-written buffer) is about to be reused for the
-     * next recv.  If an io_uring write on it is still in flight, wait for it
-     * to complete before handing the buffer back to the NIC.
+     * Before reusing slots[next_recv] for the next recv, ensure any
+     * in-flight io_uring write on that slot has completed.  Drain cqes
+     * until the slot is free; handles out-of-order completions.
      */
-    if (pending_uring_write) {
+    while (use_uring && slot_pending[next_recv]) {
       struct io_uring_cqe *cqe;
       if (io_uring_wait_cqe(&ring, &cqe) < 0) return 5;
       if (cqe->res < 0) {
@@ -396,39 +400,41 @@ int main(int argc, char *argv[]) {
         io_uring_cqe_seen(&ring, cqe);
         return 5;
       }
+      int done = (int)(uintptr_t)io_uring_cqe_get_data(cqe);
+      slot_pending[done] = 0;
       io_uring_cqe_seen(&ring, cqe);
-      pending_uring_write = 0;
     }
 
+    /* Post recv into next_recv immediately so sender can start next chunk */
     if (msgLen > 0) {
-      sge.addr = (uintptr_t)buf2;
-
+      sge.addr = (uintptr_t)slots[next_recv];
+      sge.length = buf_size;
       if (ibv_post_recv(qp, &recv_wr, &bad_recv_wr))
         return 5;
     }
 
+    /* ACK the sender */
     sge.length = 1;
     if (ibv_post_send(qp, &send_wr, &bad_send_wr))
       return 6;
     sge.length = buf_size;
 
-    /* Wait for send (ACK) completion */
+    /* Wait for ACK send completion */
     if (ibv_get_cq_event(comp_chan, &evt_cq, &cq_context))
       return 7;
-
     if (ibv_req_notify_cq(cq, 0))
       return 8;
-
     if (ibv_poll_cq(cq, 1, &wc) < 1)
       return 9;
-
     if (wc.status != IBV_WC_SUCCESS)
       return 10;
 
     event_count += 2;
 
+    /* Key verification and write */
     if (msgLen <= buf_size) {
-      cbuf = (char *)buf;
+      char *cbuf = (char *)slots[recv_slot];
+      uint32_t i;
       for (i = 0; i < msgLen && keyIdx < keylen + 1; i++, keyIdx++, cbuf++) {
         if (*cbuf != key[keyIdx]) {
           wrongkey();
@@ -440,8 +446,9 @@ int main(int argc, char *argv[]) {
         if (use_uring) {
           struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
           io_uring_prep_write(sqe, fd, cbuf, msgLen, total_bytes);
+          io_uring_sqe_set_data(sqe, (void *)(uintptr_t)recv_slot);
           io_uring_submit(&ring);
-          pending_uring_write = 1;
+          slot_pending[recv_slot] = 1;
           total_bytes += msgLen;
         } else {
           lseek(fd, total_bytes, SEEK_SET);
@@ -458,25 +465,34 @@ int main(int argc, char *argv[]) {
       }
     }
 
-    if (msgLen == 0) {
+    if (msgLen == 0)
       break;
-    }
+
+    recv_slot = next_recv;
+    next_recv = (recv_slot + 1) % (int)ring_size;
   }
 
-  /* Wait for any in-flight io_uring write to finish before closing */
-  if (pending_uring_write) {
-    struct io_uring_cqe *cqe;
-    if (io_uring_wait_cqe(&ring, &cqe) == 0) {
-      if (cqe->res < 0)
-        fprintf(stderr, "io_uring final write error: %s\n", strerror(-cqe->res));
-      io_uring_cqe_seen(&ring, cqe);
+  /* Drain all remaining in-flight io_uring writes */
+  if (use_uring) {
+    for (uint32_t s = 0; s < ring_size; s++) {
+      if (slot_pending[s]) {
+        struct io_uring_cqe *cqe;
+        if (io_uring_wait_cqe(&ring, &cqe) == 0) {
+          if (cqe->res < 0)
+            fprintf(stderr, "io_uring final write error: %s\n",
+                    strerror(-cqe->res));
+          int done = (int)(uintptr_t)io_uring_cqe_get_data(cqe);
+          slot_pending[done] = 0;
+          io_uring_cqe_seen(&ring, cqe);
+        }
+      }
     }
-  }
-
-  if (use_uring)
     io_uring_queue_exit(&ring);
+  }
 
   close(fd);
+  free(slots);
+  free(slot_pending);
 
   ibv_ack_cq_events(cq, event_count);
 
