@@ -1,6 +1,6 @@
 /*
  * build:
- * cc -o rdrecv rdrecv.c -libverbs -fopenmp
+ * cc -o rdrecv rdrecv.c -libverbs -luring
  *
  * usage:
  * rdrecv <port> <key>
@@ -16,10 +16,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <infiniband/verbs.h>
-#include <omp.h>
+#include <liburing.h>
 
 enum {
   RESOLVE_TIMEOUT_MS = 5000,
@@ -158,21 +159,28 @@ int main(int argc, char *argv[]) {
   key = argv[argv_idx++];
   keylen = strlen(key);
 
-  int use_parallel_writes = 0;
+  int use_uring = 0;
+  int pending_uring_write = 0;
+  struct io_uring ring;
+
   int fd = STDOUT_FILENO;
-  int fds[8];
   if (argv_idx < argc) {
-    fd = open(argv[argv_idx], O_WRONLY | O_CREAT | O_TRUNC,
+    /* Try O_DIRECT first (good for NVMe); fall back for tmpfs/char devices */
+    fd = open(argv[argv_idx], O_WRONLY | O_CREAT | O_TRUNC | O_DIRECT,
               S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+    if (fd < 0) {
+      fd = open(argv[argv_idx], O_WRONLY | O_CREAT | O_TRUNC,
+                S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+    }
     if (fd < 0) {
       fprintf(stderr, "Error opening file %s (%d)\n", argv[argv_idx], errno);
       return 200;
     }
-    use_parallel_writes = 1;
-    for (int i = 0; i < 8; i++) {
-      fds[i] = open(argv[argv_idx], O_WRONLY | O_DIRECT);
-      if (fds[i] < 0) {
-        use_parallel_writes = 0;
+
+    struct stat st;
+    if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode)) {
+      if (io_uring_queue_init(4, &ring, 0) == 0) {
+        use_uring = 1;
       }
     }
   }
@@ -364,7 +372,7 @@ int main(int argc, char *argv[]) {
 
     buf2MsgLen = wc.byte_len;
 
-    /* Flip buffers */
+    /* Flip buffers: buf gets the received data, buf2 becomes free */
     tmp = buf;
     buf = buf2;
     buf2 = tmp;
@@ -374,6 +382,23 @@ int main(int argc, char *argv[]) {
     buf2MsgLen = tmpLen;
 
     uint32_t msgLen = bufMsgLen;
+
+    /*
+     * buf2 (now the previously-written buffer) is about to be reused for the
+     * next recv.  If an io_uring write on it is still in flight, wait for it
+     * to complete before handing the buffer back to the NIC.
+     */
+    if (pending_uring_write) {
+      struct io_uring_cqe *cqe;
+      if (io_uring_wait_cqe(&ring, &cqe) < 0) return 5;
+      if (cqe->res < 0) {
+        fprintf(stderr, "io_uring write error: %s\n", strerror(-cqe->res));
+        io_uring_cqe_seen(&ring, cqe);
+        return 5;
+      }
+      io_uring_cqe_seen(&ring, cqe);
+      pending_uring_write = 0;
+    }
 
     if (msgLen > 0) {
       sge.addr = (uintptr_t)buf2;
@@ -412,45 +437,23 @@ int main(int argc, char *argv[]) {
         }
       }
       if (i == 0) {
-        if (use_parallel_writes == 0 || total_bytes % 4096 != 0 ||
-            msgLen != buf_size) {
+        if (use_uring) {
+          struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+          io_uring_prep_write(sqe, fd, cbuf, msgLen, total_bytes);
+          io_uring_submit(&ring);
+          pending_uring_write = 1;
+          total_bytes += msgLen;
+        } else {
           lseek(fd, total_bytes, SEEK_SET);
           ssize_t res = write(fd, cbuf, msgLen);
-          while (res < msgLen) {
+          while (res >= 0 && (size_t)res < msgLen) {
             res += write(fd, cbuf + res, msgLen - res);
           }
-          total_bytes += res;
-          if (res == -1) {
+          if (res < 0) {
             fprintf(stderr, "Write error %d\n", errno);
             break;
           }
-        } else {
-          if (ftruncate(fd, total_bytes + msgLen) != 0) {
-            fprintf(stderr, "ftruncate error %d\n", errno);
-            break;
-          }
-          ssize_t buf_written_bytes = 0;
-          int error = 0;
-          size_t wchunk = buf_size / 8;
-#pragma omp parallel for
-          for (int j = 0; j < 8; j++) {
-            lseek(fds[j], total_bytes + j * wchunk, SEEK_SET);
-            ssize_t res = 0;
-            while (res < (ssize_t)wchunk) {
-              res += write(fds[j], cbuf + j * wchunk + res, wchunk - res);
-            }
-#pragma omp atomic
-            buf_written_bytes += res;
-
-            if (res == -1) {
-              fprintf(stderr, "Write error %d\n", errno);
-              error = 1;
-            }
-          }
-          if (error == 1) {
-            break;
-          }
-          total_bytes += buf_written_bytes;
+          total_bytes += res;
         }
       }
     }
@@ -460,10 +463,20 @@ int main(int argc, char *argv[]) {
     }
   }
 
-  close(fd);
-  for (i = 0; i < 8; i++) {
-    close(fds[i]);
+  /* Wait for any in-flight io_uring write to finish before closing */
+  if (pending_uring_write) {
+    struct io_uring_cqe *cqe;
+    if (io_uring_wait_cqe(&ring, &cqe) == 0) {
+      if (cqe->res < 0)
+        fprintf(stderr, "io_uring final write error: %s\n", strerror(-cqe->res));
+      io_uring_cqe_seen(&ring, cqe);
+    }
   }
+
+  if (use_uring)
+    io_uring_queue_exit(&ring);
+
+  close(fd);
 
   ibv_ack_cq_events(cq, event_count);
 

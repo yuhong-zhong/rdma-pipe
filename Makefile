@@ -1,8 +1,8 @@
 CC=gcc
-CFLAGS=-fopenmp -O2 -mavx -Wall -Werror
+CFLAGS=-O2 -mavx -Wall -Werror
 INCLUDES=
 LDFLAGS=
-LIBS=-libverbs
+LIBS=-libverbs -luring
 
 SRCS=rdsend.c rdrecv.c
 OBJS=$(SRCS:.c=.o)
