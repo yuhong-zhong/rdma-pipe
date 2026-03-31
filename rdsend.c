@@ -1,5 +1,5 @@
 /*
- * cc -o rdsend rdsend.c -libverbs -luring
+ * cc -o rdsend rdsend.c -libverbs
  *
  * usage:
  * rdsend [-v] <server> <port> <key> [filename]
@@ -30,10 +30,6 @@
 #include <unistd.h>
 
 #include <infiniband/verbs.h>
-
-enum {
-  RESOLVE_TIMEOUT_MS = 5000,
-};
 
 struct qp_info {
   uint32_t qpn;
@@ -215,7 +211,6 @@ int main(int argc, char *argv[]) {
   uint32_t buf_size = params.buf_size;
 
   int fd = STDIN_FILENO;
-  int fds[16];
   if (argv_idx < argc) {
     fd = open(argv[argv_idx], O_RDONLY);
     if (fd < 0) {
@@ -225,14 +220,6 @@ int main(int argc, char *argv[]) {
     struct stat st;
     if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode))
       params.file_size = (uint64_t)st.st_size;
-    for (int i = 0; i < 16; i++) {
-      fds[i] = open(argv[argv_idx], O_RDONLY | O_DIRECT);
-      posix_fadvise(fds[i], 0, 0, POSIX_FADV_NOREUSE);
-      if (fds[i] < 0) {
-        fprintf(stderr, "Error opening file %s\n", argv[argv_idx]);
-        return 200;
-      }
-    }
   }
 
   /* Connect TCP and send params to rdrecv before allocating buffers.
@@ -426,7 +413,7 @@ int main(int argc, char *argv[]) {
     buf2 = tmp;
 
     if (fd != STDIN_FILENO) {
-      ssize_t r = pread(fds[0], buf, buf_size, total_bytes);
+      ssize_t r = pread(fd, buf, buf_size, total_bytes);
       buf_read_bytes = r > 0 ? (uint64_t)r : 0;
     } else {
       buf_read_bytes = max(0, read(fd, buf, buf_size));
