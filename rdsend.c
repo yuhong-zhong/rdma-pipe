@@ -1,13 +1,17 @@
 /*
- * cc -o rdsend rdsend.c -libverbs -fopenmp
+ * cc -o rdsend rdsend.c -libverbs -luring
  *
  * usage:
- * rdsend <server> <port> <key>
+ * rdsend [-v] <server> <port> <key> [filename]
  *
  * Reads data from stdin and RDMA sends it to the given server and port,
  * authenticating with the key.
  *
  * Uses a TCP socket for QP handshake to avoid ibacm dependency.
+ *
+ * Environment variables (sender decides, receiver follows):
+ *   RDMA_BUF_SIZE   - chunk size in MB (default 32)
+ *   RDMA_RING_SIZE  - receiver ring depth (default 4)
  */
 #define _GNU_SOURCE
 
@@ -18,7 +22,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
@@ -33,6 +39,13 @@ struct qp_info {
   uint32_t qpn;
   uint32_t psn;
   union ibv_gid gid;
+};
+
+/* Sent by rdsend to rdrecv before RDMA setup so rdrecv can allocate correctly */
+struct rdma_params {
+  uint32_t buf_size;
+  uint32_t ring_size;
+  uint64_t file_size;  /* 0 = unknown (stdin source) */
 };
 
 void usage() {
@@ -152,9 +165,6 @@ int main(int argc, char *argv[]) {
 
   uint64_t total_bytes, buf_read_bytes;
   int wr_id = 1, more_to_send = 1;
-  uint32_t buf_size = 32 * 1024 * 1024;
-  const char *bs_env = getenv("RDMA_BUF_SIZE");
-  if (bs_env) buf_size = (uint32_t)atoi(bs_env) * 1024 * 1024;
   uint32_t buf_len = 0;
 
   char *host, *ports;
@@ -190,6 +200,20 @@ int main(int argc, char *argv[]) {
   key = argv[argv_idx++];
   keylen = strlen(key);
 
+  /* Sender decides buf_size and ring_size; these are sent to rdrecv before
+   * RDMA setup so the receiver can allocate accordingly. */
+  struct rdma_params params = {
+      .buf_size  = 32 * 1024 * 1024,
+      .ring_size = 4,
+  };
+  const char *bs_env = getenv("RDMA_BUF_SIZE");
+  if (bs_env) params.buf_size = (uint32_t)atoi(bs_env) * 1024 * 1024;
+  const char *rs_env = getenv("RDMA_RING_SIZE");
+  if (rs_env) params.ring_size = (uint32_t)atoi(rs_env);
+  if (params.ring_size < 2) params.ring_size = 2;
+
+  uint32_t buf_size = params.buf_size;
+
   int fd = STDIN_FILENO;
   int fds[16];
   if (argv_idx < argc) {
@@ -198,6 +222,9 @@ int main(int argc, char *argv[]) {
       fprintf(stderr, "Error opening file %s\n", argv[argv_idx]);
       return 200;
     }
+    struct stat st;
+    if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode))
+      params.file_size = (uint64_t)st.st_size;
     for (int i = 0; i < 16; i++) {
       fds[i] = open(argv[argv_idx], O_RDONLY | O_DIRECT);
       posix_fadvise(fds[i], 0, 0, POSIX_FADV_NOREUSE);
@@ -208,12 +235,41 @@ int main(int argc, char *argv[]) {
     }
   }
 
-  if (posix_memalign((void *)&buf, 4096, buf_size * 2 + 4)) {
-    perror("posix_memalign failed");
-    return 113;
+  /* Connect TCP and send params to rdrecv before allocating buffers.
+   * This lets rdrecv allocate the right size ring immediately. */
+  int tcp_sock = -1;
+  int retries = 0;
+  while (tcp_sock < 0) {
+    tcp_sock = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in addr = {
+        .sin_family = AF_INET,
+        .sin_port = htons(port),
+    };
+    inet_aton(host, &addr.sin_addr);
+    if (connect(tcp_sock, (struct sockaddr *)&addr, sizeof(addr)) == 0) break;
+    close(tcp_sock);
+    tcp_sock = -1;
+    retries++;
+    if (retries > 300) {
+      fprintf(stderr, "Connection timed out\n");
+      return 199;
+    }
+    nanosleep((const struct timespec[]){{0, 10000000L}}, NULL);
   }
-  buf2 = (uint32_t *)(((char *)buf) + buf_size);
+
+  if (write(tcp_sock, &params, sizeof(params)) != sizeof(params)) {
+    fprintf(stderr, "Failed to send params\n");
+    return 198;
+  }
+
+  /* 2 send buffers + 4 bytes for ACK recv, huge-page backed for fast ibv_reg_mr */
   buf_len = buf_size * 2 + 4;
+  buf = mmap(NULL, buf_len, PROT_READ | PROT_WRITE,
+             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (buf == MAP_FAILED) { perror("mmap failed"); return 113; }
+  madvise(buf, buf_len, MADV_HUGEPAGE);
+  memset(buf, 0, buf_len);  /* prefault before ibv_reg_mr */
+  buf2 = (uint32_t *)(((char *)buf) + buf_size);
 
   // Find RDMA device for target
   uint8_t port_num;
@@ -263,27 +319,7 @@ int main(int argc, char *argv[]) {
                         IBV_QP_ACCESS_FLAGS))
     return 115;
 
-  // Connect via TCP and exchange QP info, with retry
-  int tcp_sock = -1;
-  int retries = 0;
-  while (tcp_sock < 0) {
-    tcp_sock = socket(AF_INET, SOCK_STREAM, 0);
-    struct sockaddr_in addr = {
-        .sin_family = AF_INET,
-        .sin_port = htons(port),
-    };
-    inet_aton(host, &addr.sin_addr);
-    if (connect(tcp_sock, (struct sockaddr *)&addr, sizeof(addr)) == 0) break;
-    close(tcp_sock);
-    tcp_sock = -1;
-    retries++;
-    if (retries > 300) {
-      fprintf(stderr, "Connection timed out\n");
-      return 199;
-    }
-    nanosleep((const struct timespec[]){{0, 10000000L}}, NULL);
-  }
-
+  /* Exchange QP info over the same TCP connection */
   uint32_t local_psn = (uint32_t)(lrand48() & 0xFFFFFF);
   struct qp_info local_info = {
       .qpn = qp->qp_num,
@@ -347,7 +383,7 @@ int main(int argc, char *argv[]) {
                         IBV_QP_MAX_QP_RD_ATOMIC))
     return 119;
 
-  /* Prepost recv */
+  /* Prepost recv for ACK */
   rsge.addr = (uintptr_t)(((char *)buf) + 2 * buf_size);
   rsge.length = 4;
   rsge.lkey = mr->lkey;

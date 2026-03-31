@@ -2,7 +2,7 @@ CC=gcc
 CFLAGS=-O2 -mavx -Wall -Werror
 INCLUDES=
 LDFLAGS=
-LIBS=-libverbs -luring
+LIBS=-libverbs
 
 SRCS=rdsend.c rdrecv.c
 OBJS=$(SRCS:.c=.o)

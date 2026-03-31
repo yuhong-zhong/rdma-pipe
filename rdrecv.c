@@ -1,17 +1,15 @@
 /*
  * build:
- * cc -o rdrecv rdrecv.c -libverbs -luring
+ * cc -o rdrecv rdrecv.c -libverbs
  *
  * usage:
- * rdrecv <port> <key>
+ * rdrecv [-v] <port> <key> <filename>
  *
  * Waits for client to connect to given port and authenticate with the key.
  * Uses a TCP socket for QP handshake to avoid ibacm dependency.
  *
- * Environment variables:
- *   RDMA_BUF_SIZE   - buffer size in MB (default 32)
- *   RDMA_RING_SIZE  - number of ring slots (default 4); allows up to
- *                     RDMA_RING_SIZE-1 io_uring writes in flight at once
+ * buf_size, ring_size, and file_size are sent by the sender (rdsend) at the
+ * start of the TCP handshake.  rdrecv has no tuning env vars of its own.
  */
 #define _GNU_SOURCE
 
@@ -21,11 +19,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <infiniband/verbs.h>
-#include <liburing.h>
 
 enum {
   RESOLVE_TIMEOUT_MS = 5000,
@@ -37,8 +36,22 @@ struct qp_info {
   union ibv_gid gid;
 };
 
+/* Received from rdsend before RDMA setup */
+struct rdma_params {
+  uint32_t buf_size;
+  uint32_t ring_size;
+  uint64_t file_size;  /* 0 = unknown (stdin source) */
+};
+
+static double now_sec(void) {
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return t.tv_sec + t.tv_nsec * 1e-9;
+}
+#define TS(label) fprintf(stderr, "TS %.3f %s\n", now_sec() - _ts0, label)
+
 void usage() {
-  fprintf(stderr, "USAGE: rdrecv [-v] <port> <key> [filename]\n");
+  fprintf(stderr, "USAGE: rdrecv [-v] <port> <key> <filename>\n");
 }
 
 void wrongkey() { fprintf(stderr, "Wrong key received\n"); }
@@ -85,7 +98,6 @@ struct ibv_context *find_rdma_device_by_ip(uint32_t local_ip,
       for (int gidx = 0; gidx < pattr.gid_tbl_len; gidx++) {
         union ibv_gid gid;
         if (ibv_query_gid(ctx, port, gidx, &gid)) continue;
-        // RoCEv2 IPv4-mapped GID: bytes 0-9 zero, 10-11 0xFF, 12-15 IPv4
         if (gid.raw[10] == 0xFF && gid.raw[11] == 0xFF) {
           uint32_t gid_ip;
           memcpy(&gid_ip, &gid.raw[12], 4);
@@ -107,6 +119,7 @@ struct ibv_context *find_rdma_device_by_ip(uint32_t local_ip,
 }
 
 int main(int argc, char *argv[]) {
+  double _ts0 = now_sec();
   struct ibv_context *ctx = NULL;
   struct ibv_pd *pd = NULL;
   struct ibv_comp_channel *comp_chan = NULL;
@@ -135,7 +148,7 @@ int main(int argc, char *argv[]) {
   int verbose = 0;
   int argv_idx = 1;
 
-  if (argc < 3) {
+  if (argc < 4) {
     usage();
     return 1;
   }
@@ -159,59 +172,20 @@ int main(int argc, char *argv[]) {
   key = argv[argv_idx++];
   keylen = strlen(key);
 
-  /* Buffer and ring sizing from environment */
-  uint32_t buf_size = 32 * 1024 * 1024;
-  const char *bs_env = getenv("RDMA_BUF_SIZE");
-  if (bs_env) buf_size = (uint32_t)atoi(bs_env) * 1024 * 1024;
-
-  uint32_t ring_size = 4;
-  const char *rs_env = getenv("RDMA_RING_SIZE");
-  if (rs_env) ring_size = (uint32_t)atoi(rs_env);
-  if (ring_size < 2) ring_size = 2;
-
-  /* Allocate ring slots as one contiguous pinned region */
-  char *ring_base;
-  if (posix_memalign((void **)&ring_base, 4096, (size_t)buf_size * ring_size)) {
-    perror("posix_memalign failed");
+  if (argv_idx >= argc) {
+    usage();
     return 1;
   }
+  const char *filename = argv[argv_idx];
 
-  void **slots = malloc(ring_size * sizeof(void *));
-  int  *slot_pending = calloc(ring_size, sizeof(int));
-  if (!slots || !slot_pending) { perror("malloc"); return 1; }
-  for (uint32_t s = 0; s < ring_size; s++)
-    slots[s] = ring_base + (size_t)s * buf_size;
-
-  int recv_slot = 0;   /* slot data just arrived into */
-  int next_recv = 1 % (int)ring_size; /* slot to post next recv into */
-
-  int use_uring = 0;
-  struct io_uring ring;
-
-  int fd = STDOUT_FILENO;
-  if (argv_idx < argc) {
-    /* Try O_DIRECT first (good for NVMe); fall back for tmpfs/char devices */
-    fd = open(argv[argv_idx], O_WRONLY | O_CREAT | O_TRUNC | O_DIRECT,
-              S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
-    if (fd < 0) {
-      fd = open(argv[argv_idx], O_WRONLY | O_CREAT | O_TRUNC,
-                S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
-    }
-    if (fd < 0) {
-      fprintf(stderr, "Error opening file %s (%d)\n", argv[argv_idx], errno);
-      return 200;
-    }
-
-    struct stat st;
-    if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode)) {
-      /* ring_size entries in the SQ: one per in-flight write */
-      if (io_uring_queue_init(ring_size, &ring, 0) == 0) {
-        use_uring = 1;
-      }
-    }
+  /* Open output file (no O_TRUNC so existing pages survive for warm rewrites) */
+  int fd = open(filename, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+  if (fd < 0) {
+    fprintf(stderr, "Error opening file %s (%d)\n", filename, errno);
+    return 200;
   }
 
-  // TCP listen for handshake
+  /* TCP: accept connection and receive params from sender */
   int listen_sock = socket(AF_INET, SOCK_STREAM, 0);
   if (listen_sock < 0) return 1;
 
@@ -234,7 +208,49 @@ int main(int argc, char *argv[]) {
   close(listen_sock);
   if (tcp_sock < 0) return 1;
 
-  // Find local IP of accepted connection to select the right RDMA device
+  struct rdma_params params;
+  if (read(tcp_sock, &params, sizeof(params)) != sizeof(params)) {
+    fprintf(stderr, "Failed to receive params from sender\n");
+    return 1;
+  }
+  uint32_t buf_size  = params.buf_size;
+  uint32_t ring_size = params.ring_size;
+  if (ring_size < 2) ring_size = 2;
+
+  /* Map output file into memory for zero-copy writes.
+   * Pre-size to file_size so we do one ftruncate now and one trim at the end.
+   * Opening without O_TRUNC preserves existing pages for warm rewrites. */
+  char   *file_map      = NULL;
+  size_t  file_map_size = 0;
+  if (params.file_size > 0) {
+    TS("ftruncate+mmap start");
+    file_map_size = params.file_size;
+    if (ftruncate(fd, (off_t)file_map_size) < 0) {
+      perror("ftruncate"); return 1;
+    }
+    file_map = mmap(NULL, file_map_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (file_map == MAP_FAILED) { perror("mmap file"); return 1; }
+    TS("ftruncate+mmap done");
+  }
+
+  /* Allocate RDMA ring (anonymous, separate from file mapping) */
+  size_t ring_bytes = (size_t)buf_size * ring_size;
+  TS("mmap ring start");
+  char *ring_base = mmap(NULL, ring_bytes, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (ring_base == MAP_FAILED) { perror("mmap ring failed"); return 1; }
+  madvise(ring_base, ring_bytes, MADV_HUGEPAGE);
+  TS("mmap ring done");
+
+  void **slots = malloc(ring_size * sizeof(void *));
+  if (!slots) { perror("malloc"); return 1; }
+  for (uint32_t s = 0; s < ring_size; s++)
+    slots[s] = ring_base + (size_t)s * buf_size;
+
+  int recv_slot = 0;
+  int next_recv = 1 % (int)ring_size;
+
+  /* Find RDMA device from local IP of accepted TCP connection */
   struct sockaddr_in local_addr;
   socklen_t local_len = sizeof(local_addr);
   getsockname(tcp_sock, (struct sockaddr *)&local_addr, &local_len);
@@ -261,10 +277,12 @@ int main(int argc, char *argv[]) {
 
   if (ibv_req_notify_cq(cq, 0)) return 1;
 
-  mr = ibv_reg_mr(pd, ring_base, (size_t)buf_size * ring_size,
+  TS("ibv_reg_mr start");
+  mr = ibv_reg_mr(pd, ring_base, ring_bytes,
                   IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
                       IBV_ACCESS_REMOTE_WRITE);
   if (!mr) return 1;
+  TS("ibv_reg_mr done");
 
   qp_attr.send_cq = cq;
   qp_attr.recv_cq = cq;
@@ -277,7 +295,6 @@ int main(int argc, char *argv[]) {
   qp = ibv_create_qp(pd, &qp_attr);
   if (!qp) return 1;
 
-  // Move QP to INIT
   struct ibv_qp_attr init_attr = {
       .qp_state = IBV_QPS_INIT,
       .pkey_index = 0,
@@ -290,18 +307,17 @@ int main(int argc, char *argv[]) {
                           IBV_QP_ACCESS_FLAGS);
   if (err) return err;
 
-  /* Post initial receive into slot 0 */
-  sge.addr = (uintptr_t)slots[0];
+  /* Post initial recv into slot 0 */
+  sge.addr   = (uintptr_t)slots[0];
   sge.length = buf_size;
-  sge.lkey = mr->lkey;
-
+  sge.lkey   = mr->lkey;
   recv_wr.sg_list = &sge;
   recv_wr.num_sge = 1;
-
   if (ibv_post_recv(qp, &recv_wr, &bad_recv_wr))
     return 1;
 
-  // Exchange QP info via TCP (rdrecv sends first)
+  TS("QP ready");
+  /* Exchange QP info over the same TCP connection */
   uint32_t local_psn = (uint32_t)(lrand48() & 0xFFFFFF);
   struct qp_info local_info = {
       .qpn = qp->qp_num,
@@ -322,7 +338,6 @@ int main(int argc, char *argv[]) {
   }
   close(tcp_sock);
 
-  // Move QP to RTR
   struct ibv_qp_attr rtr_attr = {
       .qp_state = IBV_QPS_RTR,
       .path_mtu = IBV_MTU_4096,
@@ -330,18 +345,16 @@ int main(int argc, char *argv[]) {
       .rq_psn = remote_info.psn,
       .max_dest_rd_atomic = 1,
       .min_rnr_timer = 12,
-      .ah_attr =
-          {
-              .is_global = 1,
-              .grh =
-                  {
-                      .dgid = remote_info.gid,
-                      .sgid_index = gid_idx,
-                      .hop_limit = 64,
-                  },
-              .sl = 0,
-              .port_num = port_num,
+      .ah_attr = {
+          .is_global = 1,
+          .grh = {
+              .dgid = remote_info.gid,
+              .sgid_index = gid_idx,
+              .hop_limit = 64,
           },
+          .sl = 0,
+          .port_num = port_num,
+      },
   };
   err = ibv_modify_qp(qp, &rtr_attr,
                       IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU |
@@ -349,7 +362,6 @@ int main(int argc, char *argv[]) {
                           IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER);
   if (err) return err;
 
-  // Move QP to RTS
   struct ibv_qp_attr rts_attr = {
       .qp_state = IBV_QPS_RTS,
       .timeout = 14,
@@ -364,22 +376,19 @@ int main(int argc, char *argv[]) {
                           IBV_QP_MAX_QP_RD_ATOMIC);
   if (err) return err;
 
-  // Set up send WR for ACKs
-  send_wr.opcode = IBV_WR_SEND;
+  send_wr.opcode     = IBV_WR_SEND;
   send_wr.send_flags = IBV_SEND_SIGNALED;
-  send_wr.sg_list = &sge;
-  send_wr.num_sge = 1;
+  send_wr.sg_list    = &sge;
+  send_wr.num_sge    = 1;
 
   ssize_t total_bytes = 0;
 
+  TS("transfer start");
   while (1) {
     /* Wait for receive completion into slots[recv_slot] */
-    if (ibv_get_cq_event(comp_chan, &evt_cq, &cq_context))
-      return 1;
-    if (ibv_req_notify_cq(cq, 0))
-      return 2;
-    if (ibv_poll_cq(cq, 1, &wc) < 1)
-      return 3;
+    if (ibv_get_cq_event(comp_chan, &evt_cq, &cq_context)) return 1;
+    if (ibv_req_notify_cq(cq, 0))                          return 2;
+    if (ibv_poll_cq(cq, 1, &wc) < 1)                      return 3;
     if (wc.status != IBV_WC_SUCCESS) {
       fprintf(stderr, "%s\n", ibv_wc_status_str(wc.status));
       return 4;
@@ -387,47 +396,22 @@ int main(int argc, char *argv[]) {
 
     uint32_t msgLen = wc.byte_len;
 
-    /*
-     * Before reusing slots[next_recv] for the next recv, ensure any
-     * in-flight io_uring write on that slot has completed.  Drain cqes
-     * until the slot is free; handles out-of-order completions.
-     */
-    while (use_uring && slot_pending[next_recv]) {
-      struct io_uring_cqe *cqe;
-      if (io_uring_wait_cqe(&ring, &cqe) < 0) return 5;
-      if (cqe->res < 0) {
-        fprintf(stderr, "io_uring write error: %s\n", strerror(-cqe->res));
-        io_uring_cqe_seen(&ring, cqe);
-        return 5;
-      }
-      int done = (int)(uintptr_t)io_uring_cqe_get_data(cqe);
-      slot_pending[done] = 0;
-      io_uring_cqe_seen(&ring, cqe);
-    }
-
-    /* Post recv into next_recv immediately so sender can start next chunk */
+    /* Post next recv immediately so sender can start the next chunk */
     if (msgLen > 0) {
-      sge.addr = (uintptr_t)slots[next_recv];
+      sge.addr   = (uintptr_t)slots[next_recv];
       sge.length = buf_size;
-      if (ibv_post_recv(qp, &recv_wr, &bad_recv_wr))
-        return 5;
+      if (ibv_post_recv(qp, &recv_wr, &bad_recv_wr)) return 5;
     }
 
     /* ACK the sender */
     sge.length = 1;
-    if (ibv_post_send(qp, &send_wr, &bad_send_wr))
-      return 6;
+    if (ibv_post_send(qp, &send_wr, &bad_send_wr)) return 6;
     sge.length = buf_size;
 
-    /* Wait for ACK send completion */
-    if (ibv_get_cq_event(comp_chan, &evt_cq, &cq_context))
-      return 7;
-    if (ibv_req_notify_cq(cq, 0))
-      return 8;
-    if (ibv_poll_cq(cq, 1, &wc) < 1)
-      return 9;
-    if (wc.status != IBV_WC_SUCCESS)
-      return 10;
+    if (ibv_get_cq_event(comp_chan, &evt_cq, &cq_context)) return 7;
+    if (ibv_req_notify_cq(cq, 0))                          return 8;
+    if (ibv_poll_cq(cq, 1, &wc) < 1)                      return 9;
+    if (wc.status != IBV_WC_SUCCESS)                       return 10;
 
     event_count += 2;
 
@@ -442,66 +426,44 @@ int main(int argc, char *argv[]) {
           return 20;
         }
       }
-      if (i == 0) {
-        if (use_uring) {
-          struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
-          io_uring_prep_write(sqe, fd, cbuf, msgLen, total_bytes);
-          io_uring_sqe_set_data(sqe, (void *)(uintptr_t)recv_slot);
-          io_uring_submit(&ring);
-          slot_pending[recv_slot] = 1;
-          total_bytes += msgLen;
+      if (i == 0 && msgLen > 0) {
+        if (file_map) {
+          memcpy(file_map + total_bytes, cbuf, msgLen);
         } else {
-          lseek(fd, total_bytes, SEEK_SET);
           ssize_t res = write(fd, cbuf, msgLen);
-          while (res >= 0 && (size_t)res < msgLen) {
+          while (res >= 0 && (size_t)res < msgLen)
             res += write(fd, cbuf + res, msgLen - res);
-          }
-          if (res < 0) {
-            fprintf(stderr, "Write error %d\n", errno);
-            break;
-          }
-          total_bytes += res;
+          if (res < 0) { fprintf(stderr, "Write error %d\n", errno); break; }
         }
+        total_bytes += msgLen;
       }
     }
 
-    if (msgLen == 0)
-      break;
+    if (msgLen == 0) { TS("transfer done"); break; }
 
     recv_slot = next_recv;
     next_recv = (recv_slot + 1) % (int)ring_size;
   }
 
-  /* Drain all remaining in-flight io_uring writes */
-  if (use_uring) {
-    for (uint32_t s = 0; s < ring_size; s++) {
-      if (slot_pending[s]) {
-        struct io_uring_cqe *cqe;
-        if (io_uring_wait_cqe(&ring, &cqe) == 0) {
-          if (cqe->res < 0)
-            fprintf(stderr, "io_uring final write error: %s\n",
-                    strerror(-cqe->res));
-          int done = (int)(uintptr_t)io_uring_cqe_get_data(cqe);
-          slot_pending[done] = 0;
-          io_uring_cqe_seen(&ring, cqe);
-        }
-      }
-    }
-    io_uring_queue_exit(&ring);
+  /* Trim file to actual bytes written */
+  if (file_map) {
+    TS("munmap+ftruncate start");
+    munmap(file_map, file_map_size);
+    if (ftruncate(fd, (off_t)total_bytes) < 0) perror("ftruncate final");
+    TS("munmap+ftruncate done");
   }
-
   close(fd);
   free(slots);
-  free(slot_pending);
 
   ibv_ack_cq_events(cq, event_count);
-
   ibv_destroy_qp(qp);
   ibv_dereg_mr(mr);
   ibv_destroy_cq(cq);
   ibv_dealloc_pd(pd);
   ibv_destroy_comp_channel(comp_chan);
   ibv_close_device(ctx);
+
+  munmap(ring_base, ring_bytes);
 
   return 0;
 }
